@@ -8,6 +8,7 @@ csdf:
   marker_layer: 10         # GDS layer of square marker shapes
   mask_layer: 1            # GDS layer of mask polygons
   truncation_px: 3.0       # band half-width t
+  marker_margin_nm: 0.0    # expand each marker by this many nm on every side during rasterization
   # patch_size_px is DERIVED: ceil(marker_size_nm / grid_res_nm_per_px), rounded to multiple of c
 
 dataset:

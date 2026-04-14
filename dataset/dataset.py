@@ -109,20 +109,17 @@ class CsdfDataset(Dataset):
         with open(manifest_path) as f:
             manifest: dict[str, Any] = yaml.safe_load(f)
 
-        grid_res = float(config["csdf"]["grid_res_nm_per_px"])
-        truncation_px = float(config["csdf"]["truncation_px"])
-
+        checks = [
+            ("grid_res_nm_per_px", float(config["csdf"]["grid_res_nm_per_px"])),
+            ("truncation_px",      float(config["csdf"]["truncation_px"])),
+            ("marker_margin_nm",   float(config["csdf"].get("marker_margin_nm", 0.0))),
+        ]
         mismatches: list[str] = []
-        if abs(float(manifest.get("grid_res_nm_per_px", 0)) - grid_res) > 1e-9:
-            mismatches.append(
-                f"grid_res_nm_per_px: manifest={manifest.get('grid_res_nm_per_px')},"
-                f" config={grid_res}"
-            )
-        if abs(float(manifest.get("truncation_px", 0)) - truncation_px) > 1e-9:
-            mismatches.append(
-                f"truncation_px: manifest={manifest.get('truncation_px')},"
-                f" config={truncation_px}"
-            )
+        for key, expected in checks:
+            if abs(float(manifest.get(key, 0)) - expected) > 1e-9:
+                mismatches.append(
+                    f"{key}: manifest={manifest.get(key)}, config={expected}"
+                )
         if mismatches:
             raise RuntimeError(
                 "Cache manifest mismatch — regenerate with 'python dataset/rasterize.py':\n"

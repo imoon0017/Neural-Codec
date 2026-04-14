@@ -103,12 +103,17 @@ def _rasterize_file(
     marker_layer: int,
     grid_res_nm_per_px: float,
     truncation_px: float,
+    marker_margin_nm: float,
     force: bool,
 ) -> bool:
     """Rasterize one layout file → single canvas ``.npy`` + origin sidecar YAML.
 
     All markers in the layout are rasterized in a single ``rasterize_canvas``
-    call and composited onto one float32 ``[H, W]`` array.
+    call and composited onto one float32 ``[H, W]`` array.  Each marker patch
+    is expanded by *marker_margin_nm* on every side so that the cSDF is not
+    artificially truncated at the marker boundary; the canvas origin is shifted
+    outward by the same amount.  The Dataset crops the inner ``[S, S]`` patch
+    (the original marker area) at load time using the stored canvas origin.
 
     Returns ``True`` if the file was written, ``False`` if it already existed
     and *force* is ``False``.
@@ -166,16 +171,22 @@ def _rasterize_file(
                     marker_contours[m_idx].extend(_poly_to_pwcl(poly, dbu_um))
                     break
 
-    # ── Compute canvas dimensions ─────────────────────────────────────────────
-    canvas_x0_nm = _dbu_to_nm(layout_bbox.left,   dbu_um)
-    canvas_y0_nm = _dbu_to_nm(layout_bbox.bottom, dbu_um)
-    canvas_W = math.ceil(_dbu_to_nm(layout_bbox.width(),  dbu_um) / grid_res_nm_per_px)
-    canvas_H = math.ceil(_dbu_to_nm(layout_bbox.height(), dbu_um) / grid_res_nm_per_px)
+    # ── Compute canvas dimensions (expanded by marker_margin_nm on every side) ─
+    canvas_x0_nm = _dbu_to_nm(layout_bbox.left,   dbu_um) - marker_margin_nm
+    canvas_y0_nm = _dbu_to_nm(layout_bbox.bottom, dbu_um) - marker_margin_nm
+    canvas_W = math.ceil(
+        (_dbu_to_nm(layout_bbox.width(),  dbu_um) + 2.0 * marker_margin_nm) / grid_res_nm_per_px
+    )
+    canvas_H = math.ceil(
+        (_dbu_to_nm(layout_bbox.height(), dbu_um) + 2.0 * marker_margin_nm) / grid_res_nm_per_px
+    )
 
-    # ── Build batch and rasterize ─────────────────────────────────────────────
+    # ── Build batch (each patch expanded by margin) and rasterize ────────────
     batch = [
-        (marker_contours[m_idx], mx_nm, my_nm,
-         math.ceil(msize_nm / grid_res_nm_per_px))
+        (marker_contours[m_idx],
+         mx_nm - marker_margin_nm,
+         my_nm - marker_margin_nm,
+         math.ceil((msize_nm + 2.0 * marker_margin_nm) / grid_res_nm_per_px))
         for m_idx, (_, mx_nm, my_nm, msize_nm) in enumerate(markers)
         if m_idx in marker_contours
     ]
@@ -233,6 +244,7 @@ def rasterize_rows(
 
     grid_res = float(config["csdf"]["grid_res_nm_per_px"])
     truncation_px = float(config["csdf"]["truncation_px"])
+    marker_margin_nm = float(config["csdf"].get("marker_margin_nm", 0.0))
     mask_layer = int(config["csdf"]["mask_layer"])
     marker_layer = int(config["csdf"]["marker_layer"])
     cache_dir = _PROJECT_ROOT / config["dataset"]["cache_dir"]
@@ -253,7 +265,7 @@ def rasterize_rows(
             oas_abs = str(_PROJECT_ROOT / file_rel)
             written = _rasterize_file(
                 oas_abs, npy_out, meta_out,
-                mask_layer, marker_layer, grid_res, truncation_px, force,
+                mask_layer, marker_layer, grid_res, truncation_px, marker_margin_nm, force,
             )
             if written:
                 generated.append(Path(npy_out))
@@ -265,7 +277,7 @@ def rasterize_rows(
                 fut = exe.submit(
                     _rasterize_file,
                     oas_abs, npy_out, meta_out,
-                    mask_layer, marker_layer, grid_res, truncation_px, force,
+                    mask_layer, marker_layer, grid_res, truncation_px, marker_margin_nm, force,
                 )
                 futures[fut] = (file_rel, npy_out)
             for fut in as_completed(futures):

@@ -217,16 +217,17 @@ def _check_cache(
     else:
         with open(manifest_path) as f:
             manifest: dict[str, Any] = yaml.safe_load(f)
-        if abs(float(manifest.get("grid_res_nm_per_px", 0)) - grid_res) > 1e-9:
-            errors.append(
-                f"Manifest grid_res_nm_per_px={manifest.get('grid_res_nm_per_px')}"
-                f" does not match config={grid_res}"
-            )
-        if abs(float(manifest.get("truncation_px", 0)) - truncation_px) > 1e-9:
-            errors.append(
-                f"Manifest truncation_px={manifest.get('truncation_px')}"
-                f" does not match config={truncation_px}"
-            )
+        marker_margin_nm = float(config["csdf"].get("marker_margin_nm", 0.0))
+        checks = [
+            ("grid_res_nm_per_px", grid_res),
+            ("truncation_px",      truncation_px),
+            ("marker_margin_nm",   marker_margin_nm),
+        ]
+        for key, expected in checks:
+            if abs(float(manifest.get(key, 0)) - expected) > 1e-9:
+                errors.append(
+                    f"Manifest {key}={manifest.get(key)} does not match config={expected}"
+                )
 
     # One .npy + _meta.yaml per unique layout file
     missing_npy: list[str] = []

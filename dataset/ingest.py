@@ -284,11 +284,14 @@ def write_manifest(
     csdf_source = _PROJECT_ROOT / "csdf" / "csdf_utils.py"
     csdf_hash = hashlib.sha256(csdf_source.read_bytes()).hexdigest()[:12]
 
+    marker_margin_nm = float(config["csdf"].get("marker_margin_nm", 0.0))
+
     manifest = {
         "grid_res_nm_per_px": grid_res,
         "marker_size_nm": marker_size_nm,
         "patch_size_px": patch_size_px,
         "truncation_px": truncation_px,
+        "marker_margin_nm": marker_margin_nm,
         "n_polygons": len(rows),
         "csdf_module_hash": csdf_hash,
     }
