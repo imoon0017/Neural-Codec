@@ -16,9 +16,6 @@ Supports two modes controlled by ``dataset.mode`` in the config YAML:
         "file":        str (relative path to source .oas),
         "polygon_idx": int,
     }
-
-A random-translation augmentation (shift up to ±8 px, zero-padded) is
-applied **only** to the ``"train"`` split.
 """
 
 from __future__ import annotations
@@ -40,35 +37,6 @@ log = logging.getLogger(__name__)
 _DATASET_DIR: Path = Path(__file__).resolve().parent
 _PROJECT_ROOT: Path = _DATASET_DIR.parent
 _VALID_SPLITS: frozenset[str] = frozenset({"train", "validation", "test"})
-_AUGMENT_MAX_SHIFT_PX: int = 8
-
-
-# ─── Translation augmentation ─────────────────────────────────────────────────
-
-
-def _random_translate(patch: np.ndarray, max_shift: int) -> np.ndarray:
-    """Randomly shift a 2-D cSDF patch and zero-pad the vacated border.
-
-    Args:
-        patch: float32 array of shape ``[H, W]``.
-        max_shift: Maximum translation magnitude in pixels (each axis, each sign).
-
-    Returns:
-        Shifted array of the same shape; exterior pixels are filled with 0.0.
-    """
-    H, W = patch.shape
-    dy = int(np.random.randint(-max_shift, max_shift + 1))
-    dx = int(np.random.randint(-max_shift, max_shift + 1))
-
-    result = np.zeros_like(patch)
-    # Source window
-    sy0 = max(0, -dy);  sy1 = min(H, H - dy)
-    sx0 = max(0, -dx);  sx1 = min(W, W - dx)
-    # Destination window
-    dy0 = max(0, dy);   dy1 = min(H, H + dy)
-    dx0 = max(0, dx);   dx1 = min(W, W + dx)
-    result[dy0:dy1, dx0:dx1] = patch[sy0:sy1, sx0:sx1]
-    return result
 
 
 # ─── Dataset class ────────────────────────────────────────────────────────────
@@ -81,8 +49,6 @@ class CsdfDataset(Dataset):
         config: Parsed YAML config dict.
         split: One of ``"train"``, ``"validation"``, ``"test"``.
         catalog_path: Override the default ``dataset/catalog.csv`` location.
-        augment: Apply random-translation augmentation.  Defaults to
-            ``True`` when ``split="train"``, ``False`` otherwise.
     """
 
     def __init__(
@@ -90,7 +56,6 @@ class CsdfDataset(Dataset):
         config: dict[str, Any],
         split: str,
         catalog_path: Path | None = None,
-        augment: bool | None = None,
     ) -> None:
         if split not in _VALID_SPLITS:
             raise ValueError(f"split must be one of {_VALID_SPLITS}, got {split!r}")
@@ -108,7 +73,6 @@ class CsdfDataset(Dataset):
         self._marker_layer: int = int(config["csdf"]["marker_layer"])
         self._cache_dir: Path = _PROJECT_ROOT / config["dataset"]["cache_dir"]
         self._raw_dir: Path = _PROJECT_ROOT / config["paths"]["dataset_root"]
-        self._augment: bool = (split == "train") if augment is None else augment
 
         # Load catalog
         if catalog_path is None:
@@ -128,8 +92,8 @@ class CsdfDataset(Dataset):
         self._layout_cache: dict[str, Any] = {}
 
         log.info(
-            "CsdfDataset [%s, %s]: %d samples, augment=%s",
-            split, self._mode, len(self._rows), self._augment,
+            "CsdfDataset [%s, %s]: %d samples",
+            split, self._mode, len(self._rows),
         )
 
     # ── Manifest verification ─────────────────────────────────────────────────
@@ -177,9 +141,6 @@ class CsdfDataset(Dataset):
             patch = self._load_cached(row)
         else:
             patch = self._rasterize_on_the_fly(row)
-
-        if self._augment:
-            patch = _random_translate(patch, _AUGMENT_MAX_SHIFT_PX)
 
         csdf_tensor = torch.from_numpy(patch).unsqueeze(0)  # [1, S, S]
         return {
