@@ -204,8 +204,8 @@ def _check_cache(
     truncation_px: float,
     errors: list[str],
 ) -> None:
-    """Check .npy existence, shape, and manifest freshness."""
-    from dataset.rasterize import npy_path
+    """Check per-layout canvas .npy + meta YAML existence, and manifest freshness."""
+    from dataset.rasterize import npy_path, meta_path
 
     # Manifest check
     manifest_path = cache_dir / "manifest.yaml"
@@ -228,32 +228,35 @@ def _check_cache(
                 f" does not match config={truncation_px}"
             )
 
-    # .npy existence and shape
+    # One .npy + _meta.yaml per unique layout file
     missing_npy: list[str] = []
-    shape_errors: list[str] = []
+    missing_meta: list[str] = []
 
+    seen_files: set[str] = set()
     for row in rows:
+        if row["file"] in seen_files:
+            continue
+        seen_files.add(row["file"])
+
         npy = npy_path(row, cache_dir)
         if not npy.exists():
             missing_npy.append(str(npy.relative_to(_PROJECT_ROOT)))
-            continue
-        patch = np.load(npy)
-        S = int(row["patch_size_px"])
-        if patch.shape != (S, S):
-            shape_errors.append(
-                f"{npy.name}: expected ({S},{S}), got {patch.shape}"
-            )
+
+        meta = meta_path(row, cache_dir)
+        if not meta.exists():
+            missing_meta.append(str(meta.relative_to(_PROJECT_ROOT)))
 
     if missing_npy:
         errors.append(
-            f"{len(missing_npy)} .npy file(s) missing:\n"
+            f"{len(missing_npy)} canvas .npy file(s) missing:\n"
             + "\n".join(f"  {p}" for p in missing_npy[:10])
             + (f"\n  … and {len(missing_npy) - 10} more" if len(missing_npy) > 10 else "")
         )
-    if shape_errors:
+    if missing_meta:
         errors.append(
-            f"{len(shape_errors)} .npy file(s) with wrong shape:\n"
-            + "\n".join(f"  {e}" for e in shape_errors[:10])
+            f"{len(missing_meta)} canvas meta YAML file(s) missing:\n"
+            + "\n".join(f"  {p}" for p in missing_meta[:10])
+            + (f"\n  … and {len(missing_meta) - 10} more" if len(missing_meta) > 10 else "")
         )
 
 

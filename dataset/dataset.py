@@ -152,15 +152,40 @@ class CsdfDataset(Dataset):
     # ── Cached mode ───────────────────────────────────────────────────────────
 
     def _load_cached(self, row: dict[str, Any]) -> np.ndarray:
-        from dataset.rasterize import npy_path
+        from dataset.rasterize import npy_path, meta_path
 
-        path = npy_path(row, self._cache_dir)
-        if not path.exists():
+        canvas_file = npy_path(row, self._cache_dir)
+        meta_file = meta_path(row, self._cache_dir)
+
+        if not canvas_file.exists():
             raise FileNotFoundError(
-                f"Cached patch missing: {path}.  "
+                f"Canvas .npy missing: {canvas_file}.  "
                 "Run 'python dataset/rasterize.py' or use mode='on_the_fly'."
             )
-        return np.load(path)
+        if not meta_file.exists():
+            raise FileNotFoundError(
+                f"Canvas meta YAML missing: {meta_file}.  "
+                "Run 'python dataset/rasterize.py' or use mode='on_the_fly'."
+            )
+
+        canvas = np.load(canvas_file)
+        with open(meta_file) as f:
+            meta = yaml.safe_load(f)
+
+        x0_nm = float(meta["canvas_x0_nm"])
+        y0_nm = float(meta["canvas_y0_nm"])
+        S = int(row["patch_size_px"])
+
+        col0 = round((float(row["marker_x_nm"]) - x0_nm) / self._grid_res)
+        row0 = round((float(row["marker_y_nm"]) - y0_nm) / self._grid_res)
+
+        patch = canvas[row0 : row0 + S, col0 : col0 + S]
+        if patch.shape != (S, S):
+            raise RuntimeError(
+                f"Cropped patch shape {patch.shape} != expected ({S}, {S}) "
+                f"for {Path(row['file']).name} poly {row['polygon_idx']}"
+            )
+        return patch
 
     # ── On-the-fly mode ───────────────────────────────────────────────────────
 

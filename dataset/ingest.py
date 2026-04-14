@@ -59,7 +59,9 @@ _GDS_EXTS: frozenset[str] = frozenset({".gds", ".gds2", ".gdsii", ".gdx"})
 
 _CATALOG_COLUMNS: list[str] = [
     "file", "cell", "layer", "datatype", "polygon_idx",
-    "marker_size_nm", "patch_size_px", "bbox_x_nm", "bbox_y_nm",
+    "marker_size_nm", "patch_size_px",
+    "marker_x_nm", "marker_y_nm",
+    "bbox_x_nm", "bbox_y_nm",
     "n_vertices", "has_curves", "split",
 ]
 
@@ -219,7 +221,10 @@ def _extract_file_rows(
                 sum(pt.x for pt in hull_pts) // len(hull_pts),
                 sum(pt.y for pt in hull_pts) // len(hull_pts),
             )
-            if not any(box.contains(centroid) for box in cell_markers):
+            containing_marker: db.Box | None = next(
+                (box for box in cell_markers if box.contains(centroid)), None
+            )
+            if containing_marker is None:
                 log.warning(
                     "%s cell='%s' poly=%d: no containing marker — skipping",
                     oas_path.name, cell.name, poly_idx,
@@ -240,7 +245,9 @@ def _extract_file_rows(
                 "polygon_idx": poly_idx,
                 "marker_size_nm": round(marker_size_nm, 4),
                 "patch_size_px": patch_size_px,
-                "bbox_x_nm": round(_dbu_to_nm(bbox.width(), dbu_um), 4),
+                "marker_x_nm": round(_dbu_to_nm(containing_marker.left,   dbu_um), 4),
+                "marker_y_nm": round(_dbu_to_nm(containing_marker.bottom, dbu_um), 4),
+                "bbox_x_nm": round(_dbu_to_nm(bbox.width(),  dbu_um), 4),
                 "bbox_y_nm": round(_dbu_to_nm(bbox.height(), dbu_um), 4),
                 "n_vertices": n_verts,
                 "has_curves": False,

@@ -1,25 +1,25 @@
 """Dataset rasterization script.
 
-Iterates over entries in ``catalog.csv`` and converts each polygon + its
-containing marker into a pre-rasterized ``float32 [S, S]`` ``.npy`` patch
-saved under ``dataset/cache/<split>/``.
+Iterates over unique layout files listed in ``catalog.csv`` and rasterizes
+each one into a single float32 ``[H, W]`` canvas ``.npy`` file, identical to
+the ``rasterize_oas.py`` pipeline.  A small YAML sidecar records the canvas
+origin so the Dataset can crop the correct per-marker patch at load time.
 
-Output filename convention::
+Output per layout file::
 
-    cache/<split>/<oas_stem>_cell_<cell>_layer_<layer>_poly_<idx>.npy
+    cache/<split>/<stem>.npy        — float32 [H, W] full canvas
+    cache/<split>/<stem>_meta.yaml  — {canvas_x0_nm, canvas_y0_nm}
 
-Writes (or refreshes) ``cache/manifest.yaml`` on completion so that
-``verify_dataset`` and the Dataset class can confirm cache freshness.
+Also writes ``cache/manifest.yaml`` on completion.
 
 Usage::
 
     python dataset/rasterize.py \\
         --config  train/config/baseline.yaml \\
         --splits  train validation test \\
-        --workers 8 \\
-        --device  cpu
+        --workers 8
 
-    # Force-rebuild even if .npy files already exist:
+    # Force-rebuild even if files already exist:
     python dataset/rasterize.py --config ... --force
 """
 
@@ -27,10 +27,10 @@ from __future__ import annotations
 
 import argparse
 import logging
-import re
+import math
 import sys
+from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from itertools import groupby
 from pathlib import Path
 from typing import Any
 
@@ -41,7 +41,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import klayout.db as db
 
-from csdf.csdf_utils import PwclContour, PwclSegment, SegmentType, rasterize_patch
+from csdf.csdf_utils import PwclContour, PwclSegment, SegmentType, rasterize_canvas
 
 log = logging.getLogger(__name__)
 
@@ -49,7 +49,20 @@ _DATASET_DIR: Path = Path(__file__).resolve().parent
 _PROJECT_ROOT: Path = _DATASET_DIR.parent
 
 
-# ─── Shared helpers ───────────────────────────────────────────────────────────
+# ─── Path helpers ─────────────────────────────────────────────────────────────
+
+
+def npy_path(row: dict[str, Any], cache_dir: Path) -> Path:
+    """Full-canvas ``.npy`` path for the layout file that contains *row*."""
+    return cache_dir / row["split"] / f"{Path(row['file']).stem}.npy"
+
+
+def meta_path(row: dict[str, Any], cache_dir: Path) -> Path:
+    """Canvas-origin sidecar YAML path for the layout file that contains *row*."""
+    return cache_dir / row["split"] / f"{Path(row['file']).stem}_meta.yaml"
+
+
+# ─── Shared geometry helpers ──────────────────────────────────────────────────
 
 
 def _dbu_to_nm(val: float, dbu_um: float) -> float:
@@ -65,7 +78,6 @@ def _shape_to_polygon(shape: db.Shape) -> db.Polygon | None:
 
 
 def _poly_to_pwcl(poly: db.Polygon, dbu_um: float) -> list[PwclContour]:
-    """Convert a KLayout Polygon (with holes) to PWCL LINE contours."""
     def pts_nm(it: Any) -> list[tuple[float, float]]:
         return [(_dbu_to_nm(pt.x, dbu_um), _dbu_to_nm(pt.y, dbu_um)) for pt in it]
 
@@ -80,45 +92,31 @@ def _poly_to_pwcl(poly: db.Polygon, dbu_um: float) -> list[PwclContour]:
     return out
 
 
-def npy_filename(file_rel: str, cell: str, layer: int | str, poly_idx: int | str) -> str:
-    """Return the ``.npy`` filename for one catalog row.
-
-    Sanitises the cell name so the filename is filesystem-safe.
-    """
-    stem = Path(file_rel).stem
-    cell_safe = re.sub(r"[^A-Za-z0-9]", "_", cell)
-    return f"{stem}_cell_{cell_safe}_layer_{layer}_poly_{poly_idx}.npy"
+# ─── Per-file rasterization (worker-safe) ────────────────────────────────────
 
 
-def npy_path(row: dict[str, Any], cache_dir: Path) -> Path:
-    """Return the full ``.npy`` path for one catalog row."""
-    return (
-        cache_dir
-        / row["split"]
-        / npy_filename(row["file"], row["cell"], row["layer"], row["polygon_idx"])
-    )
-
-
-# ─── Per-file rasterization (runs in worker processes) ───────────────────────
-
-
-def _rasterize_file_rows(
+def _rasterize_file(
     oas_abs: str,
-    rows: list[dict[str, Any]],
+    npy_out: str,
+    meta_out: str,
     mask_layer: int,
     marker_layer: int,
     grid_res_nm_per_px: float,
     truncation_px: float,
-    cache_dir_str: str,
     force: bool,
-) -> list[str]:
-    """Load one OASIS file and rasterize all catalog rows that belong to it.
+) -> bool:
+    """Rasterize one layout file → single canvas ``.npy`` + origin sidecar YAML.
 
-    Designed to run inside a worker process — returns a list of generated
-    ``.npy`` path strings (only newly written files are included).
+    All markers in the layout are rasterized in a single ``rasterize_canvas``
+    call and composited onto one float32 ``[H, W]`` array.
+
+    Returns ``True`` if the file was written, ``False`` if it already existed
+    and *force* is ``False``.
     """
-    cache_dir = Path(cache_dir_str)
-    out_paths: list[str] = []
+    npy_p = Path(npy_out)
+    meta_p = Path(meta_out)
+    if npy_p.exists() and meta_p.exists() and not force:
+        return False
 
     layout = db.Layout()
     layout.read(oas_abs)
@@ -126,68 +124,85 @@ def _rasterize_file_rows(
     mask_li = layout.layer(mask_layer, 0)
     marker_li = layout.layer(marker_layer, 0)
 
-    for row in rows:
-        out = npy_path(row, cache_dir)
-        if out.exists() and not force:
-            continue
+    # ── Collect all square markers ────────────────────────────────────────────
+    markers: list[tuple[db.Box, float, float, float]] = []  # (box, x0_nm, y0_nm, size_nm)
+    layout_bbox = db.Box()
 
-        cell = layout.cell(row["cell"])
-        if cell is None:
-            log.warning("Cell '%s' not found in %s — skipping poly %s",
-                        row["cell"], oas_abs, row["polygon_idx"])
-            continue
+    for cell in layout.each_cell():
+        for shape in cell.shapes(marker_li).each():
+            if not shape.is_box():
+                continue
+            box = shape.box
+            w_nm = _dbu_to_nm(box.width(), dbu_um)
+            h_nm = _dbu_to_nm(box.height(), dbu_um)
+            if abs(w_nm - h_nm) > 0.5:
+                continue
+            markers.append((box,
+                            _dbu_to_nm(box.left,   dbu_um),
+                            _dbu_to_nm(box.bottom, dbu_um),
+                            w_nm))
+            layout_bbox += box
 
-        # ── Find polygon at poly_idx ─────────────────────────────────────────
-        target_idx = int(row["polygon_idx"])
-        target_poly: db.Polygon | None = None
-        idx = 0
+    if not markers:
+        return False
+
+    # ── Group mask polygons by marker ─────────────────────────────────────────
+    marker_contours: dict[int, list[PwclContour]] = defaultdict(list)
+
+    for cell in layout.each_cell():
         for shape in cell.shapes(mask_li).each():
             poly = _shape_to_polygon(shape)
             if poly is None:
                 continue
-            if idx == target_idx:
-                target_poly = poly
-                break
-            idx += 1
+            hull_pts = list(poly.each_point_hull())
+            if not hull_pts:
+                continue
+            centroid = db.Point(
+                sum(pt.x for pt in hull_pts) // len(hull_pts),
+                sum(pt.y for pt in hull_pts) // len(hull_pts),
+            )
+            for m_idx, (box, *_) in enumerate(markers):
+                if box.contains(centroid):
+                    marker_contours[m_idx].extend(_poly_to_pwcl(poly, dbu_um))
+                    break
 
-        if target_poly is None:
-            log.warning("Polygon %d not found in cell '%s' of %s",
-                        target_idx, row["cell"], oas_abs)
-            continue
+    # ── Compute canvas dimensions ─────────────────────────────────────────────
+    canvas_x0_nm = _dbu_to_nm(layout_bbox.left,   dbu_um)
+    canvas_y0_nm = _dbu_to_nm(layout_bbox.bottom, dbu_um)
+    canvas_W = math.ceil(_dbu_to_nm(layout_bbox.width(),  dbu_um) / grid_res_nm_per_px)
+    canvas_H = math.ceil(_dbu_to_nm(layout_bbox.height(), dbu_um) / grid_res_nm_per_px)
 
-        # ── Find containing marker ────────────────────────────────────────────
-        hull_pts = list(target_poly.each_point_hull())
-        centroid = db.Point(
-            sum(pt.x for pt in hull_pts) // len(hull_pts),
-            sum(pt.y for pt in hull_pts) // len(hull_pts),
+    # ── Build batch and rasterize ─────────────────────────────────────────────
+    batch = [
+        (marker_contours[m_idx], mx_nm, my_nm,
+         math.ceil(msize_nm / grid_res_nm_per_px))
+        for m_idx, (_, mx_nm, my_nm, msize_nm) in enumerate(markers)
+        if m_idx in marker_contours
+    ]
+
+    if not batch:
+        return False
+
+    canvas = rasterize_canvas(
+        batch,
+        canvas_x0_nm=canvas_x0_nm,
+        canvas_y0_nm=canvas_y0_nm,
+        canvas_H=canvas_H,
+        canvas_W=canvas_W,
+        grid_res_nm_per_px=grid_res_nm_per_px,
+        truncation_px=truncation_px,
+    )
+
+    # ── Save canvas + origin sidecar ──────────────────────────────────────────
+    npy_p.parent.mkdir(parents=True, exist_ok=True)
+    np.save(npy_p, canvas)
+    with open(meta_p, "w") as f:
+        yaml.safe_dump(
+            {"canvas_x0_nm": canvas_x0_nm, "canvas_y0_nm": canvas_y0_nm},
+            f, default_flow_style=False,
         )
-        marker_box: db.Box | None = None
-        for shape in cell.shapes(marker_li).each():
-            if shape.is_box() and shape.box.contains(centroid):
-                marker_box = shape.box
-                break
 
-        if marker_box is None:
-            log.warning("No marker found for polygon %d in cell '%s' of %s",
-                        target_idx, row["cell"], oas_abs)
-            continue
-
-        # ── Rasterize ─────────────────────────────────────────────────────────
-        contours = _poly_to_pwcl(target_poly, dbu_um)
-        patch = rasterize_patch(
-            contours=contours,
-            origin_x_nm=_dbu_to_nm(marker_box.left, dbu_um),
-            origin_y_nm=_dbu_to_nm(marker_box.bottom, dbu_um),
-            patch_size_px=int(row["patch_size_px"]),
-            grid_res_nm_per_px=grid_res_nm_per_px,
-            truncation_px=truncation_px,
-        )
-
-        out.parent.mkdir(parents=True, exist_ok=True)
-        np.save(out, patch)
-        out_paths.append(str(out))
-
-    return out_paths
+    return True
 
 
 # ─── Public API ───────────────────────────────────────────────────────────────
@@ -199,20 +214,19 @@ def rasterize_rows(
     workers: int = 1,
     force: bool = False,
 ) -> list[Path]:
-    """Rasterize a list of catalog rows into ``.npy`` patches.
+    """Rasterize the layout files referenced by *rows* into canvas ``.npy`` files.
 
-    Groups rows by source file so each OASIS file is loaded only once per
-    worker.  Returns the list of ``.npy`` files that were written (skips
-    existing files unless *force* is set).
+    One ``.npy`` is produced per unique layout file (not per polygon). Rows are
+    grouped by ``file`` so each OASIS file is loaded at most once per worker.
 
     Args:
         rows: Catalog row dicts (as returned by ``load_catalog()``).
         config: Parsed YAML config dict.
         workers: Number of parallel worker processes.
-        force: Overwrite existing ``.npy`` files.
+        force: Overwrite existing ``.npy`` / ``_meta.yaml`` files.
 
     Returns:
-        List of :class:`~pathlib.Path` objects for every file written.
+        List of ``.npy`` :class:`~pathlib.Path` objects that were written.
     """
     if not rows:
         return []
@@ -223,38 +237,44 @@ def rasterize_rows(
     marker_layer = int(config["csdf"]["marker_layer"])
     cache_dir = _PROJECT_ROOT / config["dataset"]["cache_dir"]
 
-    # Group rows by source file
-    rows_by_file: dict[str, list[dict[str, Any]]] = {}
+    # Deduplicate to one task per unique layout file
+    seen: dict[str, tuple[str, str]] = {}  # file_rel → (npy_out, meta_out)
     for row in rows:
-        rows_by_file.setdefault(row["file"], []).append(row)
+        if row["file"] not in seen:
+            seen[row["file"]] = (
+                str(npy_path(row, cache_dir)),
+                str(meta_path(row, cache_dir)),
+            )
 
     generated: list[Path] = []
 
     if workers <= 1:
-        for file_rel, file_rows in rows_by_file.items():
+        for file_rel, (npy_out, meta_out) in seen.items():
             oas_abs = str(_PROJECT_ROOT / file_rel)
-            paths = _rasterize_file_rows(
-                oas_abs, file_rows, mask_layer, marker_layer,
-                grid_res, truncation_px, str(cache_dir), force,
+            written = _rasterize_file(
+                oas_abs, npy_out, meta_out,
+                mask_layer, marker_layer, grid_res, truncation_px, force,
             )
-            generated.extend(Path(p) for p in paths)
+            if written:
+                generated.append(Path(npy_out))
     else:
         futures = {}
         with ProcessPoolExecutor(max_workers=workers) as exe:
-            for file_rel, file_rows in rows_by_file.items():
+            for file_rel, (npy_out, meta_out) in seen.items():
                 oas_abs = str(_PROJECT_ROOT / file_rel)
                 fut = exe.submit(
-                    _rasterize_file_rows,
-                    oas_abs, file_rows, mask_layer, marker_layer,
-                    grid_res, truncation_px, str(cache_dir), force,
+                    _rasterize_file,
+                    oas_abs, npy_out, meta_out,
+                    mask_layer, marker_layer, grid_res, truncation_px, force,
                 )
-                futures[fut] = file_rel
+                futures[fut] = (file_rel, npy_out)
             for fut in as_completed(futures):
+                file_rel, npy_out = futures[fut]
                 try:
-                    paths = fut.result()
-                    generated.extend(Path(p) for p in paths)
+                    if fut.result():
+                        generated.append(Path(npy_out))
                 except Exception as exc:
-                    log.error("Rasterization failed for %s: %s", futures[fut], exc)
+                    log.error("Rasterization failed for %s: %s", file_rel, exc)
                     raise
 
     return generated
@@ -271,15 +291,15 @@ def rasterize_catalog(
 
     Args:
         config: Parsed YAML config dict.
-        splits: List of split names to process (default: all three splits).
+        splits: Split names to process (default: all three splits).
         workers: Parallel worker processes.
-        force: Overwrite existing ``.npy`` files.
+        force: Overwrite existing files.
         catalog_path: Override the default ``dataset/catalog.csv`` path.
 
     Returns:
         List of ``.npy`` files written.
     """
-    from dataset.ingest import load_catalog  # avoid circular at module level
+    from dataset.ingest import load_catalog
 
     if catalog_path is None:
         catalog_path = _DATASET_DIR / "catalog.csv"
@@ -292,10 +312,13 @@ def rasterize_catalog(
         log.info("No catalog rows to rasterize.")
         return []
 
-    log.info("Rasterizing %d polygon(s) with %d worker(s) …", len(all_rows), max(workers, 1))
+    unique_files = len({r["file"] for r in all_rows})
+    log.info(
+        "Rasterizing %d layout file(s) (%d polygon(s)) with %d worker(s) …",
+        unique_files, len(all_rows), max(workers, 1),
+    )
     generated = rasterize_rows(all_rows, config=config, workers=workers, force=force)
 
-    # Refresh manifest
     from dataset.ingest import write_manifest
 
     manifest_path = write_manifest(config, catalog_path=catalog_path)
@@ -339,7 +362,7 @@ def main() -> None:
         workers=args.workers,
         force=args.force,
     )
-    print(f"Rasterized / updated {len(generated)} .npy file(s).")
+    print(f"Rasterized / updated {len(generated)} layout file(s).")
 
 
 if __name__ == "__main__":
