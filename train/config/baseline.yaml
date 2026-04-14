@@ -1,0 +1,26 @@
+model:
+  latent_dim: 32           # D
+  compaction_ratio: 8      # c — power of 2, must divide S
+  quantizer_bits: 16       # B — 8 → int8 (4× smaller), 16 → int16 (2× smaller)
+
+csdf:
+  grid_res_nm_per_px: 1.0  # primary rasterization parameter (nm)
+  marker_layer: 10         # GDS layer of square marker shapes
+  mask_layer: 1            # GDS layer of mask polygons
+  truncation_px: 3.0       # band half-width t
+  # patch_size_px is DERIVED: ceil(marker_size_nm / grid_res_nm_per_px), rounded to multiple of c
+
+dataset:
+  mode: cached             # "cached" or "on_the_fly"
+  cache_dir: dataset/cache/
+
+training:
+  batch_size: 32
+  lr: 1.0e-4
+  epochs: 200
+  val_every_n_epochs: 1
+
+paths:
+  dataset_root: dataset/raw/
+  checkpoint_dir: checkpoints/
+  run_id: baseline_v1

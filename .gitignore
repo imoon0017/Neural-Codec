@@ -1,0 +1,32 @@
+# Build artefacts
+build/
+*.so
+*.o
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+*.egg
+
+# Tests / tooling
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+htmlcov/
+.coverage
+
+# Scratch / temporary outputs
+tmp/
+scripts/tmp/
+
+# Model checkpoints (large binaries — external storage)
+checkpoints/
+
+# Misc binaries
+files.zip
+
+# Claude Code local settings
+.claude/
