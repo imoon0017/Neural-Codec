@@ -54,6 +54,14 @@ def plot_loss_curves(metrics: list[dict], save_path: Path | None = None) -> None
         print("No metrics.jsonl found — skipping loss curves.")
         return
 
+    # Keep only the last training run (metrics.jsonl may contain data from
+    # earlier crashed runs; each run resets epoch to 0, so we find the last reset)
+    last_run_start = 0
+    for i, m in enumerate(metrics):
+        if m["epoch"] == 0:
+            last_run_start = i
+    metrics = metrics[last_run_start:]
+
     epochs = [m["epoch"] + 1 for m in metrics]
     train_losses = [m["train_loss"] for m in metrics]
     val_epochs = [m["epoch"] + 1 for m in metrics if "val_loss" in m]
