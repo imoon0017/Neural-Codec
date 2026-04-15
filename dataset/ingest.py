@@ -58,11 +58,9 @@ _OASIS_EXTS: frozenset[str] = frozenset({".oas", ".oasis"})
 _GDS_EXTS: frozenset[str] = frozenset({".gds", ".gds2", ".gdsii", ".gdx"})
 
 _CATALOG_COLUMNS: list[str] = [
-    "file", "cell", "layer", "datatype", "polygon_idx",
+    "file", "split",
     "marker_size_nm", "patch_size_px",
-    "marker_x_nm", "marker_y_nm",
-    "bbox_x_nm", "bbox_y_nm",
-    "n_vertices", "has_curves", "split",
+    "n_polygons", "n_vertices", "has_curves",
 ]
 
 _VALID_SPLITS: frozenset[str] = frozenset({"train", "validation", "test"})
@@ -99,11 +97,28 @@ def _load_config(config_path: Path) -> dict[str, Any]:
 
 
 def load_catalog(catalog_path: Path = _CATALOG_PATH) -> list[dict[str, Any]]:
-    """Load catalog.csv and return a list of row dicts (empty if file missing)."""
+    """Load catalog.csv and return a list of row dicts (empty if file missing).
+
+    Raises:
+        RuntimeError: If the catalog exists but has columns from an older schema.
+            Delete or migrate ``catalog.csv`` before proceeding.
+    """
     if not catalog_path.exists():
         return []
     with open(catalog_path, newline="") as f:
-        return list(csv.DictReader(f))
+        reader = csv.DictReader(f)
+        rows = list(reader)
+        if rows:
+            actual = set(reader.fieldnames or [])
+            expected = set(_CATALOG_COLUMNS)
+            stale = actual - expected
+            if stale:
+                raise RuntimeError(
+                    f"catalog.csv has unrecognised column(s) from an older schema: "
+                    f"{sorted(stale)}.  "
+                    f"Delete or migrate {catalog_path} before running ingest."
+                )
+    return rows
 
 
 def save_catalog(rows: list[dict[str, Any]], catalog_path: Path = _CATALOG_PATH) -> None:
@@ -119,7 +134,7 @@ def save_catalog(rows: list[dict[str, Any]], catalog_path: Path = _CATALOG_PATH)
 # ─── Per-file validation & row extraction ─────────────────────────────────────
 
 
-def _extract_file_rows(
+def _extract_file_info(
     oas_path: Path,
     dest_rel: str,
     mask_layer: int,
@@ -127,8 +142,8 @@ def _extract_file_rows(
     grid_res_nm_per_px: float,
     compaction_ratio: int,
     split: str,
-) -> tuple[float, list[dict[str, Any]]]:
-    """Validate one OASIS file and extract catalog rows for all its polygons.
+) -> tuple[float, dict[str, Any]]:
+    """Validate one OASIS file and extract a single catalog row with aggregate stats.
 
     Args:
         oas_path: Source OASIS file.
@@ -140,7 +155,8 @@ def _extract_file_rows(
         split: Dataset split label.
 
     Returns:
-        ``(marker_size_nm, rows)`` where *rows* is a list of catalog dicts.
+        ``(marker_size_nm, row)`` where *row* is a single catalog dict aggregating
+        statistics across all polygons in the file.
 
     Raises:
         RuntimeError: On any validation failure (KLayout load, marker check,
@@ -184,20 +200,10 @@ def _extract_file_rows(
     marker_size_nm: float = all_marker_sizes[0]
     patch_size_px: int = derive_patch_size_px(marker_size_nm, grid_res_nm_per_px, compaction_ratio)
 
-    # ── Mask layer validation (step 3) ────────────────────────────────────────
-    found_poly = False
-    for cell in layout.each_cell():
-        for shape in cell.shapes(mask_li).each():
-            if _shape_to_polygon(shape) is not None:
-                found_poly = True
-                break
-        if found_poly:
-            break
-    if not found_poly:
-        raise RuntimeError(f"No mask polygons found on layer {mask_layer}")
-
-    # ── Extract catalog rows ──────────────────────────────────────────────────
-    rows: list[dict[str, Any]] = []
+    # ── Count polygons and vertices (step 3) ──────────────────────────────────
+    n_polygons = 0
+    n_vertices = 0
+    has_curves = False
 
     for cell in layout.each_cell():
         cell_markers: list[db.Box] = [
@@ -206,7 +212,6 @@ def _extract_file_rows(
             if shape.is_box()
         ]
 
-        poly_idx = 0
         for shape in cell.shapes(mask_li).each():
             poly = _shape_to_polygon(shape)
             if poly is None:
@@ -214,48 +219,37 @@ def _extract_file_rows(
 
             hull_pts = list(poly.each_point_hull())
             if not hull_pts:
-                poly_idx += 1
                 continue
 
             centroid = db.Point(
                 sum(pt.x for pt in hull_pts) // len(hull_pts),
                 sum(pt.y for pt in hull_pts) // len(hull_pts),
             )
-            containing_marker: db.Box | None = next(
-                (box for box in cell_markers if box.contains(centroid)), None
-            )
-            if containing_marker is None:
+            if not any(box.contains(centroid) for box in cell_markers):
                 log.warning(
-                    "%s cell='%s' poly=%d: no containing marker — skipping",
-                    oas_path.name, cell.name, poly_idx,
+                    "%s cell='%s': polygon has no containing marker — skipping",
+                    oas_path.name, cell.name,
                 )
-                poly_idx += 1
                 continue
 
-            bbox = poly.bbox()
-            n_verts = poly.num_points_hull() + sum(
+            n_polygons += 1
+            n_vertices += poly.num_points_hull() + sum(
                 poly.num_points_hole(h) for h in range(poly.holes())
             )
 
-            rows.append({
-                "file": dest_rel,
-                "cell": cell.name,
-                "layer": mask_layer,
-                "datatype": 0,
-                "polygon_idx": poly_idx,
-                "marker_size_nm": round(marker_size_nm, 4),
-                "patch_size_px": patch_size_px,
-                "marker_x_nm": round(_dbu_to_nm(containing_marker.left,   dbu_um), 4),
-                "marker_y_nm": round(_dbu_to_nm(containing_marker.bottom, dbu_um), 4),
-                "bbox_x_nm": round(_dbu_to_nm(bbox.width(),  dbu_um), 4),
-                "bbox_y_nm": round(_dbu_to_nm(bbox.height(), dbu_um), 4),
-                "n_vertices": n_verts,
-                "has_curves": False,
-                "split": split,
-            })
-            poly_idx += 1
+    if n_polygons == 0:
+        raise RuntimeError(f"No mask polygons found on layer {mask_layer}")
 
-    return marker_size_nm, rows
+    row: dict[str, Any] = {
+        "file": dest_rel,
+        "split": split,
+        "marker_size_nm": round(marker_size_nm, 4),
+        "patch_size_px": patch_size_px,
+        "n_polygons": n_polygons,
+        "n_vertices": n_vertices,
+        "has_curves": has_curves,
+    }
+    return marker_size_nm, row
 
 
 # ─── Manifest helper ──────────────────────────────────────────────────────────
@@ -286,13 +280,15 @@ def write_manifest(
 
     marker_margin_nm = float(config["csdf"].get("marker_margin_nm", 0.0))
 
+    total_polygons = sum(int(r["n_polygons"]) for r in rows) if rows else 0
+
     manifest = {
         "grid_res_nm_per_px": grid_res,
         "marker_size_nm": marker_size_nm,
         "patch_size_px": patch_size_px,
         "truncation_px": truncation_px,
         "marker_margin_nm": marker_margin_nm,
-        "n_polygons": len(rows),
+        "n_polygons": total_polygons,
         "csdf_module_hash": csdf_hash,
     }
 
@@ -378,19 +374,20 @@ def ingest(
 
     # ── Steps 1-3: Validate all new files ─────────────────────────────────────
     target_dir = raw_dir / split
-    file_infos: dict[Path, tuple[float, list[dict[str, Any]]]] = {}
+    file_infos: dict[Path, tuple[float, dict[str, Any]]] = {}
 
     for src in new_files:
         dest_rel = str((target_dir / src.name).relative_to(_PROJECT_ROOT))
         log.info("Validating %s …", src.name)
         try:
-            marker_size_nm, rows = _extract_file_rows(
+            marker_size_nm, row = _extract_file_info(
                 src, dest_rel, mask_layer, marker_layer, grid_res, compaction_ratio, split,
             )
         except RuntimeError as exc:
             raise RuntimeError(f"Validation failed for {src.name}: {exc}") from exc
-        file_infos[src] = (marker_size_nm, rows)
-        log.info("  %s: %d polygons, marker %.1f nm", src.name, len(rows), marker_size_nm)
+        file_infos[src] = (marker_size_nm, row)
+        log.info("  %s: %d polygon(s), %d vertices, marker %.1f nm",
+                 src.name, row["n_polygons"], row["n_vertices"], marker_size_nm)
 
     # ── Uniform marker-size guard ─────────────────────────────────────────────
     new_sizes = {info[0] for info in file_infos.values()}
@@ -409,13 +406,8 @@ def ingest(
                 f" catalog={catalog_size:.1f} nm — mixing sizes is not allowed"
             )
 
-    # ── Flatten new catalog rows ──────────────────────────────────────────────
-    new_rows: list[dict[str, Any]] = [
-        row for _, rows in file_infos.values() for row in rows
-    ]
-    if not new_rows:
-        log.warning("No valid polygons found in %d file(s).  Nothing to ingest.", len(new_files))
-        return
+    # ── Collect new catalog rows (one per file) ───────────────────────────────
+    new_rows: list[dict[str, Any]] = [row for _, row in file_infos.values()]
 
     # ── Step 5: Copy files to raw/<split>/ ───────────────────────────────────
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -426,7 +418,11 @@ def ingest(
         copied.append(dst)
         log.info("Copied %s → %s", src.name, dst.relative_to(_PROJECT_ROOT))
 
-    # ── Track rollback state ──────────────────────────────────────────────────
+    # ── Track rollback state (raw bytes so schema changes can't break rollback) ─
+    catalog_path = _CATALOG_PATH
+    old_catalog_bytes: bytes | None = (
+        catalog_path.read_bytes() if catalog_path.exists() else None
+    )
     manifest_path = cache_dir / "manifest.yaml"
     old_manifest: str | None = manifest_path.read_text() if manifest_path.exists() else None
     generated_npy: list[Path] = []
@@ -436,11 +432,11 @@ def ingest(
         save_catalog(existing_rows + new_rows)
         log.info("catalog.csv: %d → %d rows", len(existing_rows), len(existing_rows + new_rows))
 
-        # ── Step 7: Rasterize new polygons ────────────────────────────────────
+        # ── Step 7: Rasterize new files ───────────────────────────────────────
         from dataset.rasterize import rasterize_rows  # avoid circular at import time
 
         generated_npy = rasterize_rows(new_rows, config=config, workers=workers)
-        log.info("Rasterized %d patch(es)", len(generated_npy))
+        log.info("Rasterized %d canvas(es)", len(generated_npy))
 
         # ── Step 8: Update manifest.yaml ──────────────────────────────────────
         write_manifest(config, cache_dir=cache_dir)
@@ -455,7 +451,10 @@ def ingest(
         log.error("Pipeline failure — rolling back steps 5-8")
         for dst in copied:
             dst.unlink(missing_ok=True)
-        save_catalog(existing_rows)
+        if old_catalog_bytes is None:
+            catalog_path.unlink(missing_ok=True)
+        else:
+            catalog_path.write_bytes(old_catalog_bytes)
         for npy in generated_npy:
             npy.unlink(missing_ok=True)
         if old_manifest is None:
@@ -466,11 +465,14 @@ def ingest(
 
     # ── Summary ───────────────────────────────────────────────────────────────
     patch_size_px = new_rows[0]["patch_size_px"]
+    total_new_polygons = sum(int(r["n_polygons"]) for r in new_rows)
+    total_new_vertices = sum(int(r["n_vertices"]) for r in new_rows)
     n_npy = len(list((cache_dir / split).glob("*.npy")))
 
     print(f"\nMarker size   : {new_marker_size_nm:.1f} nm (unified ✓)")
     print(f"Patch size    : {patch_size_px} px")
-    print(f"Added         : {len(new_files)} file(s) / {len(new_rows)} polygons → raw/{split}/")
+    print(f"Added         : {len(new_files)} file(s) → raw/{split}/")
+    print(f"Polygons      : {total_new_polygons} ({total_new_vertices} vertices)")
     skipped = len(source_files) - len(new_files)
     if skipped:
         print(f"Skipped (dup) : {skipped} file(s)")

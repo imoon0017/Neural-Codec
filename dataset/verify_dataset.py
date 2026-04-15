@@ -3,13 +3,12 @@
 Checks that every entry in ``catalog.csv`` is consistent and loadable:
 
 * Every ``.oas`` file listed in the catalog exists on disk.
-* Every ``polygon_idx`` is reachable (the cell exists and the index is in range).
 * Split labels are confined to ``{train, validation, test}`` with no overlap.
 * All rows share the same ``marker_size_nm`` (mixed sizes are rejected).
 * ``patch_size_px % compaction_ratio == 0`` for every row.
-* **Cache mode only**: every expected ``.npy`` file exists, has the correct
-  shape ``[patch_size_px, patch_size_px]``, and ``cache/manifest.yaml``
-  matches the current config (``grid_res_nm_per_px``, ``truncation_px``).
+* **Cache mode only**: every expected ``.npy`` file exists and
+  ``cache/manifest.yaml`` matches the current config
+  (``grid_res_nm_per_px``, ``truncation_px``, ``marker_margin_nm``).
 
 Exit codes:
   0 — all checks passed
@@ -29,7 +28,6 @@ import sys
 from pathlib import Path
 from typing import Any
 
-import numpy as np
 import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -95,7 +93,7 @@ def verify_dataset(
     for r in rows:
         psp = int(r["patch_size_px"])
         if psp % compaction_ratio != 0:
-            bad_patch.append(f"{r['file']} poly {r['polygon_idx']}: patch_size_px={psp}")
+            bad_patch.append(f"{r['file']}: patch_size_px={psp}")
     if bad_patch:
         errors.append(
             f"patch_size_px not divisible by compaction_ratio={compaction_ratio}:\n"
@@ -105,18 +103,14 @@ def verify_dataset(
 
     # ── Raw file existence ────────────────────────────────────────────────────
     missing_files: list[str] = []
-    for file_rel in {r["file"] for r in rows}:
-        if not (_PROJECT_ROOT / file_rel).exists():
-            missing_files.append(file_rel)
+    for r in rows:
+        if not (_PROJECT_ROOT / r["file"]).exists():
+            missing_files.append(r["file"])
     if missing_files:
         errors.append(
             f"{len(missing_files)} raw file(s) missing:\n"
             + "\n".join(f"  {f}" for f in sorted(missing_files)[:10])
         )
-
-    # ── Polygon index accessibility ───────────────────────────────────────────
-    # Spot-check: verify at most 50 rows (full scan would be slow at scale).
-    _spot_check_polygons(rows[:50], errors)
 
     # ── Cache checks (optional) ───────────────────────────────────────────────
     if check_cache:
@@ -128,72 +122,17 @@ def verify_dataset(
             + "\n".join(f"[{i+1}] {e}" for i, e in enumerate(errors))
         )
 
+    total_polygons = sum(int(r["n_polygons"]) for r in rows)
     log.info(
-        "verify_dataset: OK — %d rows, %d split(s), marker %.1f nm",
+        "verify_dataset: OK — %d file(s), %d polygon(s), %d split(s), marker %.1f nm",
         len(rows),
+        total_polygons,
         len({r["split"] for r in rows}),
         next(iter(sizes), 0.0),
     )
 
 
 # ─── Internal check helpers ───────────────────────────────────────────────────
-
-
-def _spot_check_polygons(rows: list[dict[str, Any]], errors: list[str]) -> None:
-    """Verify polygon_idx is reachable for a sample of rows."""
-    import klayout.db as db
-
-    def shape_to_poly(shape: Any) -> Any | None:
-        if shape.is_polygon():
-            return shape.polygon
-        if shape.is_box():
-            return db.Polygon(shape.box)
-        return None
-
-    loaded_layouts: dict[str, db.Layout] = {}
-    bad: list[str] = []
-
-    for row in rows:
-        oas_abs = str(_PROJECT_ROOT / row["file"])
-        if oas_abs not in loaded_layouts:
-            if not (_PROJECT_ROOT / row["file"]).exists():
-                continue  # already reported as missing file
-            try:
-                layout = db.Layout()
-                layout.read(oas_abs)
-                loaded_layouts[oas_abs] = layout
-            except Exception as exc:
-                bad.append(f"Cannot load {row['file']}: {exc}")
-                continue
-
-        layout = loaded_layouts[oas_abs]
-        cell = layout.cell(row["cell"])
-        if cell is None:
-            bad.append(f"Cell '{row['cell']}' not found in {row['file']}")
-            continue
-
-        mask_li = layout.layer(int(row["layer"]), 0)
-        target_idx = int(row["polygon_idx"])
-        found = False
-        idx = 0
-        for shape in cell.shapes(mask_li).each():
-            if shape_to_poly(shape) is None:
-                continue
-            if idx == target_idx:
-                found = True
-                break
-            idx += 1
-
-        if not found:
-            bad.append(
-                f"Polygon idx {target_idx} not found in cell '{row['cell']}' of {row['file']}"
-            )
-
-    if bad:
-        errors.append(
-            f"{len(bad)} polygon accessibility failure(s):\n"
-            + "\n".join(f"  {b}" for b in bad[:10])
-        )
 
 
 def _check_cache(
@@ -233,12 +172,7 @@ def _check_cache(
     missing_npy: list[str] = []
     missing_meta: list[str] = []
 
-    seen_files: set[str] = set()
     for row in rows:
-        if row["file"] in seen_files:
-            continue
-        seen_files.add(row["file"])
-
         npy = npy_path(row, cache_dir)
         if not npy.exists():
             missing_npy.append(str(npy.relative_to(_PROJECT_ROOT)))

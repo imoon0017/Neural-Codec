@@ -4,7 +4,8 @@ Supports two modes controlled by ``dataset.mode`` in the config YAML:
 
 * ``cached``     — loads pre-rasterized ``.npy`` patches from
   ``dataset/cache/<split>/``.  Verifies ``cache/manifest.yaml`` matches
-  the current config before use.
+  the current config before use.  Marker locations are read from the
+  per-file ``_meta.yaml`` sidecars written by ``rasterize.py``.
 * ``on_the_fly`` — rasterizes PWCL geometry on demand from raw OASIS
   files in ``dataset/raw/<split>/``.  Slower; intended for quick
   experiments or when the cache has not been built yet.
@@ -14,7 +15,8 @@ Supports two modes controlled by ``dataset.mode`` in the config YAML:
     {
         "csdf":        float32 tensor [1, S, S],
         "file":        str (relative path to source .oas),
-        "polygon_idx": int,
+        "marker_x_nm": float,
+        "marker_y_nm": float,
     }
 """
 
@@ -45,6 +47,11 @@ _VALID_SPLITS: frozenset[str] = frozenset({"train", "validation", "test"})
 class CsdfDataset(Dataset):
     """PyTorch Dataset serving cSDF patches for a single split.
 
+    Each dataset item corresponds to one marker region in one OASIS file.
+    The catalog (``catalog.csv``) holds one row per OASIS file; the per-file
+    ``_meta.yaml`` sidecars (written by ``rasterize.py``) record the marker
+    coordinates used to expand the item list to one entry per marker.
+
     Args:
         config: Parsed YAML config dict.
         split: One of ``"train"``, ``"validation"``, ``"test"``.
@@ -74,7 +81,7 @@ class CsdfDataset(Dataset):
         self._cache_dir: Path = _PROJECT_ROOT / config["dataset"]["cache_dir"]
         self._raw_dir: Path = _PROJECT_ROOT / config["paths"]["dataset_root"]
 
-        # Load catalog
+        # Load catalog (one row per OASIS file)
         if catalog_path is None:
             catalog_path = _DATASET_DIR / "catalog.csv"
         from dataset.ingest import load_catalog
@@ -91,9 +98,18 @@ class CsdfDataset(Dataset):
         # Per-process layout cache for on_the_fly mode (keyed by abs path str)
         self._layout_cache: dict[str, Any] = {}
 
+        # Build flat item list: one entry per (file, marker) pair
+        # Each item is (catalog_row, marker_dict) where marker_dict has
+        # keys: x_nm, y_nm, size_nm
+        self._items: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        if self._mode == "cached":
+            self._build_items_from_cache()
+        else:
+            self._build_items_on_the_fly()
+
         log.info(
-            "CsdfDataset [%s, %s]: %d samples",
-            split, self._mode, len(self._rows),
+            "CsdfDataset [%s, %s]: %d file(s), %d patch(es)",
+            split, self._mode, len(self._rows), len(self._items),
         )
 
     # ── Manifest verification ─────────────────────────────────────────────────
@@ -126,29 +142,71 @@ class CsdfDataset(Dataset):
                 + "\n".join(f"  {m}" for m in mismatches)
             )
 
+    # ── Item index construction ───────────────────────────────────────────────
+
+    def _build_items_from_cache(self) -> None:
+        """Expand catalog rows into (row, marker) pairs using meta YAML sidecars."""
+        from dataset.rasterize import meta_path
+
+        for row in self._rows:
+            meta_file = meta_path(row, self._cache_dir)
+            if not meta_file.exists():
+                raise FileNotFoundError(
+                    f"Canvas meta YAML missing: {meta_file}.  "
+                    "Run 'python dataset/rasterize.py' or use mode='on_the_fly'."
+                )
+            with open(meta_file) as f:
+                meta: dict[str, Any] = yaml.safe_load(f)
+            for marker in meta.get("markers", []):
+                self._items.append((row, marker))
+
+    def _build_items_on_the_fly(self) -> None:
+        """Expand catalog rows into (row, marker) pairs by scanning layout files."""
+        for row in self._rows:
+            oas_abs = _PROJECT_ROOT / row["file"]
+            layout = self._get_layout(oas_abs)
+            dbu_um: float = layout.dbu
+            marker_li = layout.layer(self._marker_layer, 0)
+
+            for cell in layout.each_cell():
+                for shape in cell.shapes(marker_li).each():
+                    if not shape.is_box():
+                        continue
+                    box = shape.box
+                    w_nm = box.width() * dbu_um * 1000.0
+                    h_nm = box.height() * dbu_um * 1000.0
+                    if abs(w_nm - h_nm) > 0.5:
+                        continue  # non-square; skip
+                    self._items.append((row, {
+                        "x_nm": box.left * dbu_um * 1000.0,
+                        "y_nm": box.bottom * dbu_um * 1000.0,
+                        "size_nm": w_nm,
+                    }))
+
     # ── Dataset protocol ──────────────────────────────────────────────────────
 
     def __len__(self) -> int:
-        return len(self._rows)
+        return len(self._items)
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
-        row = self._rows[idx]
+        row, marker = self._items[idx]
 
         if self._mode == "cached":
-            patch = self._load_cached(row)
+            patch = self._load_cached(row, marker)
         else:
-            patch = self._rasterize_on_the_fly(row)
+            patch = self._rasterize_on_the_fly(row, marker)
 
         csdf_tensor = torch.from_numpy(patch).unsqueeze(0)  # [1, S, S]
         return {
             "csdf": csdf_tensor,
             "file": row["file"],
-            "polygon_idx": int(row["polygon_idx"]),
+            "marker_x_nm": marker["x_nm"],
+            "marker_y_nm": marker["y_nm"],
         }
 
     # ── Cached mode ───────────────────────────────────────────────────────────
 
-    def _load_cached(self, row: dict[str, Any]) -> np.ndarray:
+    def _load_cached(self, row: dict[str, Any], marker: dict[str, Any]) -> np.ndarray:
         from dataset.rasterize import npy_path, meta_path
 
         canvas_file = npy_path(row, self._cache_dir)
@@ -173,14 +231,14 @@ class CsdfDataset(Dataset):
         y0_nm = float(meta["canvas_y0_nm"])
         S = int(row["patch_size_px"])
 
-        col0 = round((float(row["marker_x_nm"]) - x0_nm) / self._grid_res)
-        row0 = round((float(row["marker_y_nm"]) - y0_nm) / self._grid_res)
+        col0 = round((marker["x_nm"] - x0_nm) / self._grid_res)
+        row0 = round((marker["y_nm"] - y0_nm) / self._grid_res)
 
         patch = canvas[row0 : row0 + S, col0 : col0 + S]
         if patch.shape != (S, S):
             raise RuntimeError(
                 f"Cropped patch shape {patch.shape} != expected ({S}, {S}) "
-                f"for {Path(row['file']).name} poly {row['polygon_idx']}"
+                f"for {Path(row['file']).name} marker ({marker['x_nm']:.1f}, {marker['y_nm']:.1f}) nm"
             )
         return patch
 
@@ -197,8 +255,10 @@ class CsdfDataset(Dataset):
             self._layout_cache[key] = layout
         return self._layout_cache[key]
 
-    def _rasterize_on_the_fly(self, row: dict[str, Any]) -> np.ndarray:
-        """Load OASIS and rasterize the polygon described by *row* on demand."""
+    def _rasterize_on_the_fly(
+        self, row: dict[str, Any], marker: dict[str, Any]
+    ) -> np.ndarray:
+        """Load OASIS and rasterize all polygons belonging to *marker* on demand."""
         import klayout.db as db
         from csdf.csdf_utils import rasterize_patch, PwclContour, PwclSegment, SegmentType
 
@@ -209,46 +269,15 @@ class CsdfDataset(Dataset):
         mask_li = layout.layer(self._mask_layer, 0)
         marker_li = layout.layer(self._marker_layer, 0)
 
-        cell = layout.cell(row["cell"])
-        if cell is None:
-            raise RuntimeError(f"Cell '{row['cell']}' not found in {row['file']}")
-
-        # Find polygon at polygon_idx
-        target_idx = int(row["polygon_idx"])
-        target_poly: db.Polygon | None = None
-        idx = 0
-        for shape in cell.shapes(mask_li).each():
-            poly = _shape_to_polygon(shape)
-            if poly is None:
-                continue
-            if idx == target_idx:
-                target_poly = poly
-                break
-            idx += 1
-
-        if target_poly is None:
-            raise RuntimeError(
-                f"Polygon {target_idx} not found in cell '{row['cell']}' of {row['file']}"
-            )
-
-        # Find containing marker
-        hull_pts = list(target_poly.each_point_hull())
-        centroid = db.Point(
-            sum(pt.x for pt in hull_pts) // len(hull_pts),
-            sum(pt.y for pt in hull_pts) // len(hull_pts),
+        # Reconstruct the KLayout Box for this marker from nm coords
+        scale = 1.0 / (dbu_um * 1000.0)
+        marker_box = db.Box(
+            round(marker["x_nm"] * scale),
+            round(marker["y_nm"] * scale),
+            round((marker["x_nm"] + marker["size_nm"]) * scale),
+            round((marker["y_nm"] + marker["size_nm"]) * scale),
         )
-        marker_box: db.Box | None = None
-        for shape in cell.shapes(marker_li).each():
-            if shape.is_box() and shape.box.contains(centroid):
-                marker_box = shape.box
-                break
 
-        if marker_box is None:
-            raise RuntimeError(
-                f"No marker for polygon {target_idx} in cell '{row['cell']}' of {row['file']}"
-            )
-
-        # Build PWCL contours
         def dbu_to_nm(v: float) -> float:
             return v * dbu_um * 1000.0
 
@@ -257,24 +286,39 @@ class CsdfDataset(Dataset):
             segs = [PwclSegment(SegmentType.LINE, [pts[i], pts[(i + 1) % n]]) for i in range(n)]
             return PwclContour(segments=segs, is_hole=is_hole)
 
-        contours: list[PwclContour] = [
-            make_contour(
-                [(dbu_to_nm(pt.x), dbu_to_nm(pt.y)) for pt in target_poly.each_point_hull()],
-                False,
-            )
-        ]
-        for h in range(target_poly.holes()):
-            contours.append(
-                make_contour(
-                    [(dbu_to_nm(pt.x), dbu_to_nm(pt.y)) for pt in target_poly.each_point_hole(h)],
-                    True,
+        contours: list[PwclContour] = []
+        for cell in layout.each_cell():
+            for shape in cell.shapes(mask_li).each():
+                poly = _shape_to_polygon(shape)
+                if poly is None:
+                    continue
+                hull_pts = list(poly.each_point_hull())
+                if not hull_pts:
+                    continue
+                centroid = db.Point(
+                    sum(pt.x for pt in hull_pts) // len(hull_pts),
+                    sum(pt.y for pt in hull_pts) // len(hull_pts),
                 )
-            )
+                if not marker_box.contains(centroid):
+                    continue
+                contours.append(
+                    make_contour(
+                        [(dbu_to_nm(pt.x), dbu_to_nm(pt.y)) for pt in poly.each_point_hull()],
+                        False,
+                    )
+                )
+                for h in range(poly.holes()):
+                    contours.append(
+                        make_contour(
+                            [(dbu_to_nm(pt.x), dbu_to_nm(pt.y)) for pt in poly.each_point_hole(h)],
+                            True,
+                        )
+                    )
 
         return rasterize_patch(
             contours=contours,
-            origin_x_nm=dbu_to_nm(marker_box.left),
-            origin_y_nm=dbu_to_nm(marker_box.bottom),
+            origin_x_nm=marker["x_nm"],
+            origin_y_nm=marker["y_nm"],
             patch_size_px=int(row["patch_size_px"]),
             grid_res_nm_per_px=self._grid_res,
             truncation_px=self._truncation_px,

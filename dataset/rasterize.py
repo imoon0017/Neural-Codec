@@ -207,9 +207,18 @@ def _rasterize_file(
     # ── Save canvas + origin sidecar ──────────────────────────────────────────
     npy_p.parent.mkdir(parents=True, exist_ok=True)
     np.save(npy_p, canvas)
+    markers_meta = [
+        {"x_nm": mx_nm, "y_nm": my_nm, "size_nm": msize_nm}
+        for m_idx, (_, mx_nm, my_nm, msize_nm) in enumerate(markers)
+        if m_idx in marker_contours
+    ]
     with open(meta_p, "w") as f:
         yaml.safe_dump(
-            {"canvas_x0_nm": canvas_x0_nm, "canvas_y0_nm": canvas_y0_nm},
+            {
+                "canvas_x0_nm": canvas_x0_nm,
+                "canvas_y0_nm": canvas_y0_nm,
+                "markers": markers_meta,
+            },
             f, default_flow_style=False,
         )
 
