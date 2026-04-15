@@ -86,9 +86,10 @@ echo "============================================================"
 echo ""
 
 # ── CUDA allocator tuning ─────────────────────────────────────────────────────
-# expandable_segments avoids the CUDACachingAllocator internal-assert failure
-# seen with PyTorch 2.x on some driver versions.
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+# cudaMallocAsync bypasses PyTorch's CUDACachingAllocator (and its NVML calls)
+# which cause an internal-assert failure in some containerised environments.
+# Requires CUDA >= 11.2 (A100 is fine).
+export PYTORCH_CUDA_ALLOC_CONF=backend:cudaMallocAsync
 
 # ── Run ───────────────────────────────────────────────────────────────────────
 cd "${PROJECT_ROOT}"

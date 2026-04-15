@@ -259,6 +259,15 @@ def train(cfg: dict[str, Any], device: torch.device, resume: bool = False) -> No
     ckpt_dir = _ckpt_dir(cfg)
     metrics_path = ckpt_dir / "metrics.jsonl"
 
+    # ── CUDA warm-up ─────────────────────────────────────────────────────────
+    # Force full CUDA context + allocator initialisation in the main process
+    # before DataLoader workers spawn.  Prevents NVML assertion failures in
+    # containerised environments where NVML initialises lazily.
+    if device.type == "cuda":
+        _warmup = torch.zeros(1, device=device)
+        torch.cuda.synchronize()
+        del _warmup
+
     # ── Model ─────────────────────────────────────────────────────────────────
     model = CurveCodec(cfg).to(device)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
