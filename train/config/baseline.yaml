@@ -1,13 +1,14 @@
 model:
-  latent_dim: 32           # D
-  compaction_ratio: 8      # c — power of 2, must divide S
+  latent_dim: 32           # D — latent feature channels
+  compaction_ratio: 8      # c — power of 2; spatial downsampling factor (must divide S)
   quantizer_bits: 16       # B — 8 → int8 (4× smaller), 16 → int16 (2× smaller)
+  encoder_channels: 64     # C — hidden width for encoder/decoder conv layers
 
 csdf:
-  grid_res_nm_per_px: 6.0  # primary rasterization parameter (nm)
+  grid_res_nm_per_px: 6.0  # primary rasterization parameter (nm/px)
   marker_layer: 100         # GDS layer of square marker shapes
   mask_layer: 1            # GDS layer of mask polygons
-  truncation_px: 5.0       # band half-width t
+  truncation_px: 5.0       # cSDF band half-width t
   marker_margin_nm: 100    # expand each marker by this many nm on every side during rasterization
   # patch_size_px is DERIVED: ceil(marker_size_nm / grid_res_nm_per_px), rounded to multiple of c
 
@@ -17,9 +18,34 @@ dataset:
 
 training:
   batch_size: 32
-  lr: 1.0e-4
   epochs: 200
   val_every_n_epochs: 1
+
+  # Optimizer
+  optimizer: adamw         # adam | adamw | sgd
+  lr: 1.0e-4
+  weight_decay: 1.0e-2     # L2 regularisation (adamw / sgd)
+
+  # LR schedule
+  lr_scheduler: cosine     # cosine | step | none
+  lr_min: 1.0e-6           # cosine annealing floor
+  warmup_epochs: 5         # linear warmup before cosine decay
+  lr_step_size: 50         # epoch interval for step scheduler (step only)
+  lr_step_gamma: 0.5       # multiplicative factor for step scheduler (step only)
+
+  # Gradient clipping (0 = disabled)
+  grad_clip: 1.0
+
+  # DataLoader workers
+  num_workers: 4
+
+  # Loss
+  loss:
+    recon: mse             # reconstruction term: mse | l1 | huber
+    huber_delta: 1.0       # delta for huber loss (ignored for mse / l1)
+    erosion_margin_px: 16  # exclude this many pixels from every edge in loss
+                           # should cover the encoder receptive-field radius
+                           # (≈15 px for c=8 with 3 stride-2 conv stages)
 
 paths:
   dataset_root: dataset/raw/
