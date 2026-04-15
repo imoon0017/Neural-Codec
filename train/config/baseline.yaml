@@ -17,7 +17,7 @@ dataset:
   cache_dir: dataset/cache/
 
 training:
-  batch_size: 32
+  batch_size: 4   # 840×840 px patches; stem activations ~180 MB/sample on GPU
   epochs: 200
   val_every_n_epochs: 1
 
