@@ -273,12 +273,13 @@ def train(cfg: dict[str, Any], device: torch.device, resume: bool = False) -> No
     scheduler = build_scheduler(optimizer, cfg)
 
     # ── Data ──────────────────────────────────────────────────────────────────
-    num_workers: int = int(train_cfg.get("num_workers", 4))
+    num_workers: int = int(train_cfg.get("num_workers", 2))
     loaders = make_dataloaders(
         cfg,
         splits=["train", "validation"],
         num_workers=num_workers,
-        pin_memory=(device.type == "cuda"),
+        pin_memory=(device.type == "cuda" and num_workers > 0),
+        persistent_workers=(num_workers > 0),
     )
     train_loader = loaders["train"]
     val_loader = loaders["validation"]

@@ -85,6 +85,11 @@ echo "  Log    : ${LOG_FILE}"
 echo "============================================================"
 echo ""
 
+# ── CUDA allocator tuning ─────────────────────────────────────────────────────
+# expandable_segments avoids the CUDACachingAllocator internal-assert failure
+# seen with PyTorch 2.x on some driver versions.
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
 # ── Run ───────────────────────────────────────────────────────────────────────
 cd "${PROJECT_ROOT}"
 

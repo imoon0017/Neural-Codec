@@ -36,8 +36,8 @@ training:
   # Gradient clipping (0 = disabled)
   grad_clip: 1.0
 
-  # DataLoader workers
-  num_workers: 4
+  # DataLoader workers (keep ≤ CPU count / 2 to avoid pin-memory contention)
+  num_workers: 2
 
   # Loss
   loss:
