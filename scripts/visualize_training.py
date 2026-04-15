@@ -203,16 +203,21 @@ def plot_reconstructions(
     row_cmaps  = ["gray", "gray", "hot"]
     row_ranges = [(vmin, vmax), (vmin, vmax), (0.0, err_max)]
 
-    # Leave a right margin column for colorbars
-    fig = plt.figure(figsize=(4 * n + 0.6, 10))
+    # Narrow colorbar column; tight gaps between image cells
+    cell_size = 3.0          # inches per image cell
+    cbar_width = 0.18        # inches for colorbar column
+    fig = plt.figure(figsize=(cell_size * n + cbar_width + 0.6, cell_size * 3 + 0.5))
     gs = gridspec.GridSpec(
         3, n + 1,
-        hspace=0.35, wspace=0.08,
-        width_ratios=[4] * n + [0.25],
+        hspace=0.02,          # minimal vertical gap
+        wspace=0.02,          # minimal horizontal gap
+        width_ratios=[1] * n + [cbar_width / cell_size],
+        left=0.07, right=0.97, top=0.94, bottom=0.04,
     )
 
-    # Keep last image object per row to attach its colorbar
-    last_im = [None, None, None]
+    # All image axes share x and y so zoom/pan is synchronised
+    ref_ax = None
+    last_im: list = [None, None, None]
 
     for col in range(n):
         orig = patches[col]
@@ -223,13 +228,26 @@ def plot_reconstructions(
         for row, (img, cmap, (mn, mx)) in enumerate(
             zip([orig, rec, err], row_cmaps, row_ranges)
         ):
-            ax = fig.add_subplot(gs[row, col])
+            share_kw: dict = (
+                {"sharex": ref_ax, "sharey": ref_ax} if ref_ax is not None else {}
+            )
+            ax = fig.add_subplot(gs[row, col], **share_kw)
+            if ref_ax is None:
+                ref_ax = ax
+
             im = ax.imshow(img, cmap=cmap, vmin=mn, vmax=mx, interpolation="nearest")
-            ax.axis("off")
+            ax.set_xticks([])
+            ax.set_yticks([])
+            for spine in ax.spines.values():
+                spine.set_visible(False)
+
+            # Row label on the leftmost column
             if col == 0:
-                ax.set_title(row_labels[row], loc="left", fontsize=9, pad=4)
+                ax.set_ylabel(row_labels[row], fontsize=9, labelpad=4)
+            # Column label (MSE) below the bottom row
             if row == 2:
-                ax.set_xlabel(f"MSE={mse:.5f}", fontsize=8)
+                ax.set_xlabel(f"MSE={mse:.5f}", fontsize=7, labelpad=3)
+
             last_im[row] = im
 
     # Colorbars in the right margin column
@@ -238,7 +256,7 @@ def plot_reconstructions(
         cb = fig.colorbar(last_im[row], cax=cax)
         cb.ax.tick_params(labelsize=7)
         if row == 2:
-            cb.set_label("abs error\n(p99 clipped)", fontsize=7)
+            cb.set_label("p99 clip", fontsize=7)
 
     fig.suptitle(f"Reconstructions — epoch {ckpt['epoch']}", fontsize=12)
     _show_or_save(fig, save_path, "reconstructions.png")
