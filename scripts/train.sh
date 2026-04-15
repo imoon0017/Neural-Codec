@@ -5,6 +5,7 @@
 #   ./scripts/train.sh                          # default config, cuda
 #   ./scripts/train.sh --config path/to/cfg.yaml
 #   ./scripts/train.sh --device cpu
+#   ./scripts/train.sh --device gpu             # alias for cuda
 #   ./scripts/train.sh --resume
 #   ./scripts/train.sh --config my.yaml --resume --device cuda
 #
@@ -18,22 +19,45 @@ CONDA_ENV="neural_codec"
 
 # ── Parse known flags (the rest are forwarded) ───────────────────────────────
 FORWARD_ARGS=()
-CONFIG="${PROJECT_ROOT}/train/config/baseline.yaml"
+CONFIG=""
 DEVICE=""
 RESUME=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --config)   CONFIG="$2";    FORWARD_ARGS+=("--config" "$2"); shift 2 ;;
-        --device)   DEVICE="$2";    FORWARD_ARGS+=("--device" "$2"); shift 2 ;;
-        --resume)   RESUME="1";     FORWARD_ARGS+=("--resume");      shift   ;;
-        *)          FORWARD_ARGS+=("$1");                             shift   ;;
+        --config)
+            # Resolve to absolute path now, before we cd to PROJECT_ROOT
+            CONFIG="$(realpath "$2")"
+            FORWARD_ARGS+=("--config" "${CONFIG}")
+            shift 2
+            ;;
+        --device)
+            DEVICE="$2"
+            # Treat "gpu" as an alias for "cuda"
+            [[ "${DEVICE}" == "gpu" ]] && DEVICE="cuda"
+            FORWARD_ARGS+=("--device" "${DEVICE}")
+            shift 2
+            ;;
+        --resume)
+            RESUME="1"
+            FORWARD_ARGS+=("--resume")
+            shift
+            ;;
+        *)
+            FORWARD_ARGS+=("$1")
+            shift
+            ;;
     esac
 done
 
-# If --config was not explicitly passed, inject the default
-if [[ -z "$DEVICE" ]]; then
-    FORWARD_ARGS+=("--device" "cuda")
+# Default config and device when not supplied
+if [[ -z "${CONFIG}" ]]; then
+    CONFIG="${PROJECT_ROOT}/train/config/baseline.yaml"
+    FORWARD_ARGS+=("--config" "${CONFIG}")
+fi
+if [[ -z "${DEVICE}" ]]; then
+    DEVICE="cuda"
+    FORWARD_ARGS+=("--device" "${DEVICE}")
 fi
 
 # ── Resolve conda ─────────────────────────────────────────────────────────────
@@ -46,13 +70,13 @@ conda activate "${CONDA_ENV}"
 echo "============================================================"
 echo "  CurveCodec Training"
 echo "  Config : ${CONFIG}"
-echo "  Device : ${DEVICE:-cuda}"
+echo "  Device : ${DEVICE}"
 echo "  Resume : ${RESUME:-no}"
 echo "  Date   : $(date '+%Y-%m-%d %H:%M:%S')"
 echo "============================================================"
 
 # ── Extract run_id from config for log naming ─────────────────────────────────
-RUN_ID=$(python -c "import yaml,sys; c=yaml.safe_load(open('${CONFIG}')); print(c['paths']['run_id'])" 2>/dev/null || echo "run")
+RUN_ID=$(python -c "import yaml; c=yaml.safe_load(open('${CONFIG}')); print(c['paths']['run_id'])" 2>/dev/null || echo "run")
 LOG_DIR="${PROJECT_ROOT}/checkpoints/${RUN_ID}"
 mkdir -p "${LOG_DIR}"
 LOG_FILE="${LOG_DIR}/train_$(date '+%Y%m%d_%H%M%S').log"
