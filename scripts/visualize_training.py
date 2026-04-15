@@ -67,15 +67,13 @@ def plot_loss_curves(metrics: list[dict], save_path: Path | None = None) -> None
     if val_losses:
         ax1.plot(val_epochs, val_losses, label="val", color="tomato",
                  linewidth=1.5, marker="o", markersize=3)
-        best_epoch = val_epochs[int(np.argmin(val_losses))]
-        best_val = min(val_losses)
-        ax1.axvline(best_epoch, color="tomato", linestyle="--", alpha=0.4)
-        ax1.annotate(f"best={best_val:.5f}\nep {best_epoch}",
-                     xy=(best_epoch, best_val),
-                     xytext=(10, 10), textcoords="offset points",
-                     fontsize=8, color="tomato")
+        best_idx = int(np.argmin(val_losses))
+        best_epoch = val_epochs[best_idx]
+        best_val = val_losses[best_idx]
+        ax1.plot(best_epoch, best_val, marker="*", markersize=10,
+                 color="tomato", zorder=5, label=f"best val={best_val:.5f} (ep {best_epoch})")
     ax1.set_ylabel("Loss")
-    ax1.legend()
+    ax1.legend(fontsize=8)
     ax1.grid(True, alpha=0.3)
     ax1.set_yscale("log")
 
@@ -185,25 +183,38 @@ def plot_reconstructions(
         print("No validation samples — skipping reconstructions.")
         return
 
-    # Figure: input | reconstruction | error
-    fig = plt.figure(figsize=(4 * n, 10))
-    gs = gridspec.GridSpec(3, n, hspace=0.35, wspace=0.05)
-    row_labels = ["Input cSDF", "Reconstructed", "|Error|"]
-
+    # Shared scales across all samples
     vmin, vmax = 0.0, 1.0
-    err_max = max(np.abs(patches[i] - recons[i]).max() for i in range(n))
+    # Clip error colormap at 99th percentile so small errors are visible
+    all_errors = np.concatenate(
+        [np.abs(patches[i] - recons[i]).ravel() for i in range(n)]
+    )
+    err_max = float(np.percentile(all_errors, 99))
+
+    row_labels = ["Input cSDF", "Reconstructed", "|Error|"]
+    row_cmaps  = ["gray", "gray", "hot"]
+    row_ranges = [(vmin, vmax), (vmin, vmax), (0.0, err_max)]
+
+    # Leave a right margin column for colorbars
+    fig = plt.figure(figsize=(4 * n + 0.6, 10))
+    gs = gridspec.GridSpec(
+        3, n + 1,
+        hspace=0.35, wspace=0.08,
+        width_ratios=[4] * n + [0.25],
+    )
+
+    # Keep last image object per row to attach its colorbar
+    last_im = [None, None, None]
 
     for col in range(n):
         orig = patches[col]
-        rec = recons[col]
-        err = np.abs(orig - rec)
-        mse = float(np.mean((orig - rec) ** 2))
+        rec  = recons[col]
+        err  = np.abs(orig - rec)
+        mse  = float(np.mean((orig - rec) ** 2))
 
-        for row, (img, cmap, mn, mx) in enumerate([
-            (orig, "gray",     vmin, vmax),
-            (rec,  "gray",     vmin, vmax),
-            (err,  "hot",      0.0,  err_max),
-        ]):
+        for row, (img, cmap, (mn, mx)) in enumerate(
+            zip([orig, rec, err], row_cmaps, row_ranges)
+        ):
             ax = fig.add_subplot(gs[row, col])
             im = ax.imshow(img, cmap=cmap, vmin=mn, vmax=mx, interpolation="nearest")
             ax.axis("off")
@@ -211,6 +222,15 @@ def plot_reconstructions(
                 ax.set_title(row_labels[row], loc="left", fontsize=9, pad=4)
             if row == 2:
                 ax.set_xlabel(f"MSE={mse:.5f}", fontsize=8)
+            last_im[row] = im
+
+    # Colorbars in the right margin column
+    for row in range(3):
+        cax = fig.add_subplot(gs[row, n])
+        cb = fig.colorbar(last_im[row], cax=cax)
+        cb.ax.tick_params(labelsize=7)
+        if row == 2:
+            cb.set_label("abs error\n(p99 clipped)", fontsize=7)
 
     fig.suptitle(f"Reconstructions — epoch {ckpt['epoch']}", fontsize=12)
     _show_or_save(fig, save_path, "reconstructions.png")
