@@ -65,6 +65,12 @@ log = logging.getLogger(__name__)
 
 _DATASET_DIR = _PROJECT_ROOT / "dataset"
 
+# ── Inspection layer numbers (written into per-marker *_inspect.oas files) ────
+_INSP_ORIG_LAYER   = 1   # original mask polygons  (cropped to valid area)
+_INSP_RECON_LAYER  = 2   # reconstructed polygons  (cropped to valid area)
+_INSP_XOR_LAYER    = 3   # XOR symmetric difference (cropped to valid area)
+_INSP_MARKER_LAYER = 10  # valid-marker boundary box
+
 
 # ─── Architecture helpers ─────────────────────────────────────────────────────
 
@@ -349,6 +355,83 @@ def encode_file(
     return cdna_path, encode_ms
 
 
+# ─── Inspection layer writer ─────────────────────────────────────────────────
+
+
+def _write_inspection_oas(
+    path: Path,
+    orig_hulls: list[list[tuple[float, float]]],
+    recon_hulls: list[list[tuple[float, float]]],
+    crop_x0_nm: float,
+    crop_y0_nm: float,
+    crop_size_nm: float,
+    dbu_um: float,
+) -> None:
+    """Write a 4-layer inspection OASIS file for one marker.
+
+    All geometry is already cropped to the valid area (the cropping marker).
+    The XOR region is computed here via ``klayout.db.Region`` boolean XOR.
+
+    Layers written:
+
+    * ``_INSP_ORIG_LAYER``   (1)  — original mask polygons
+    * ``_INSP_RECON_LAYER``  (2)  — reconstructed mask polygons
+    * ``_INSP_XOR_LAYER``    (3)  — XOR symmetric difference
+    * ``_INSP_MARKER_LAYER`` (10) — valid-marker boundary box
+
+    Args:
+        path: Destination ``.oas`` path (created or overwritten).
+        orig_hulls: Original polygon hulls in nm, already cropped.
+        recon_hulls: Reconstructed polygon hulls in nm, already cropped.
+        crop_x0_nm: Left/bottom origin of the valid (cropping) marker in nm.
+        crop_y0_nm: Left/bottom origin of the valid (cropping) marker in nm.
+        crop_size_nm: Side length of the valid marker in nm.
+        dbu_um: Layout DBU in µm — must match the source file.
+    """
+    import klayout.db as db
+
+    scale = 1.0 / (dbu_um * 1000.0)  # nm → DBU
+
+    def _hulls_to_region(hulls: list[list[tuple[float, float]]]) -> "db.Region":
+        region = db.Region()
+        for hull in hulls:
+            pts = [db.Point(round(x * scale), round(y * scale)) for x, y in hull]
+            if len(pts) >= 3:
+                region.insert(db.Polygon(pts))
+        return region
+
+    orig_region  = _hulls_to_region(orig_hulls)
+    recon_region = _hulls_to_region(recon_hulls)
+    xor_region   = orig_region ^ recon_region
+
+    layout = db.Layout()
+    layout.dbu = dbu_um
+    cell = layout.create_cell("TOP")
+
+    def _insert_region(layer_num: int, region: "db.Region") -> None:
+        li = layout.layer(layer_num, 0)
+        for poly in region.each():
+            cell.shapes(li).insert(poly)
+
+    _insert_region(_INSP_ORIG_LAYER,  orig_region)
+    _insert_region(_INSP_RECON_LAYER, recon_region)
+    _insert_region(_INSP_XOR_LAYER,   xor_region)
+
+    li_marker = layout.layer(_INSP_MARKER_LAYER, 0)
+    cell.shapes(li_marker).insert(db.Box(
+        round(crop_x0_nm * scale),
+        round(crop_y0_nm * scale),
+        round((crop_x0_nm + crop_size_nm) * scale),
+        round((crop_y0_nm + crop_size_nm) * scale),
+    ))
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    opts = db.SaveLayoutOptions()
+    opts.format = "OASIS"
+    layout.write(str(path), opts)
+    log.debug("Inspection: wrote %s", path.name)
+
+
 # ─── Decode + crop pass ──────────────────────────────────────────────────────
 
 
@@ -362,6 +445,7 @@ def decode_file(
     orig_dir: Path,
     rf_erosion: int,
     dbu_um: float,
+    inspect_dir: Path | None = None,
 ) -> tuple[list[Path], list[Path], float]:
     """Decode ``.cdna`` → reconstructed per-marker OASIS files (cropped).
 
@@ -384,6 +468,9 @@ def decode_file(
         dbu_um: Layout DBU in µm, read from the source OASIS file.  Applied
             to both reconstructed and extracted-original ``.oas`` outputs so
             coordinates round to the same grid as the source.
+        inspect_dir: If not ``None``, write a 4-layer inspection ``.oas`` per
+            marker into this directory (original, reconstructed, XOR, valid
+            marker box on layers 1/2/3/10 respectively).
 
     Returns:
         ``(recon_paths, orig_paths, decode_ms)``
@@ -462,6 +549,20 @@ def decode_file(
         write_oas(orig_path, orig_hulls, mask_layer=mask_layer, dbu=dbu_um)
         orig_paths.append(orig_path)
 
+        if inspect_dir is not None:
+            try:
+                _write_inspection_oas(
+                    path=inspect_dir / f"{stem}_m{i:04d}_inspect.oas",
+                    orig_hulls=orig_hulls,
+                    recon_hulls=recon_hulls,
+                    crop_x0_nm=crop_x0_nm,
+                    crop_y0_nm=crop_y0_nm,
+                    crop_size_nm=crop_size_nm,
+                    dbu_um=dbu_um,
+                )
+            except Exception as exc:
+                log.warning("Inspection write failed for %s m%d: %s", stem, i, exc)
+
     log.debug("Decode: %s  N=%d  %.1f ms", cdna_path.name, len(meta["markers"]), decode_ms)
     return recon_paths, orig_paths, decode_ms
 
@@ -533,6 +634,7 @@ def evaluate(
     output_dir: Path,
     device: torch.device,
     split: str = "test",
+    inspection: bool = False,
 ) -> None:
     """Run the full encode → decode → metrics pipeline on a dataset split.
 
@@ -543,10 +645,22 @@ def evaluate(
                     ``reconstructed/``, and ``original/`` are created.
         device: PyTorch device.
         split: Dataset split — ``"train"``, ``"validation"``, or ``"test"``.
+        inspection: If ``True``, write per-marker 4-layer inspection ``.oas``
+            files to ``<output_dir>/inspection/``.
     """
     dna_dir   = output_dir / "dna"
     recon_dir = output_dir / "reconstructed"
     orig_dir  = output_dir / "original"
+    inspect_dir: Path | None = None
+    if inspection:
+        inspect_dir = output_dir / "inspection"
+        inspect_dir.mkdir(parents=True, exist_ok=True)
+        log.info(
+            "Inspection mode on — writing 4-layer .oas files to %s/  "
+            "(layers orig=%d recon=%d xor=%d marker=%d)",
+            inspect_dir.name,
+            _INSP_ORIG_LAYER, _INSP_RECON_LAYER, _INSP_XOR_LAYER, _INSP_MARKER_LAYER,
+        )
     for d in (dna_dir, recon_dir, orig_dir):
         d.mkdir(parents=True, exist_ok=True)
 
@@ -647,6 +761,7 @@ def evaluate(
                 orig_dir=orig_dir,
                 rf_erosion=rf_erosion,
                 dbu_um=dbu_um,
+                inspect_dir=inspect_dir,
             )
         except Exception as exc:
             log.error("Decode failed for %s: %s", row["file"], exc)
@@ -724,6 +839,15 @@ def parse_args() -> argparse.Namespace:
         choices=["train", "validation", "test"],
         help="Dataset split to evaluate (default: test)",
     )
+    p.add_argument(
+        "--inspection", action="store_true",
+        help=(
+            "Write per-marker 4-layer inspection .oas files to "
+            "<output-dir>/inspection/  "
+            f"(orig=layer {_INSP_ORIG_LAYER}, recon={_INSP_RECON_LAYER}, "
+            f"xor={_INSP_XOR_LAYER}, valid-marker={_INSP_MARKER_LAYER})"
+        ),
+    )
     return p.parse_args()
 
 
@@ -754,6 +878,7 @@ def main() -> None:
         output_dir=args.output_dir,
         device=device,
         split=args.split,
+        inspection=args.inspection,
     )
 
 
