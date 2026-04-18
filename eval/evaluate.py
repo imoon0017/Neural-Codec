@@ -1,34 +1,43 @@
 """Evaluation script for a trained CurveCodec checkpoint.
 
-Runs the full encode → decode pipeline on the **test** split and computes
-official metrics.  Execution order is strictly enforced:
+Runs the full codec pipeline on a dataset split (default: **test**) in strict
+sequence:
 
-1. **Encode** — rasterize test patches → export integer DNA → save ``.cdna``
-   to ``<output-dir>/dna/``
-2. **Decode** — load ``.cdna`` from disk → dequantize → decode → contour →
-   save per-marker reconstructed OASIS to ``<output-dir>/reconstructed/``
-3. **Metrics** — compare original vs reconstructed OASIS files; write
-   ``<output-dir>/results.csv`` and ``<output-dir>/summary.json``
-
-Metrics are always computed from files on disk — never from in-memory
-tensors.
+1. **Read** — load raw OASIS; extract square markers from the marker layer.
+2. **Expand** — enlarge each marker by ``marker_margin_nm`` (read from
+   ``dataset/cache/manifest.yaml``) on all four sides so the cSDF is not
+   artificially truncated at the boundary.
+3. **Rasterize** — build a shared canvas for all expanded markers and crop
+   per-marker patches ``[N, S_exp, S_exp]`` (S_exp rounded up to a multiple of
+   the compaction ratio *c*).
+4. **Codec** — encode → quantize → save ``.cdna`` → load ``.cdna`` →
+   dequantize → decode → contour.
+5. **Crop** — before ADR the reconstructed cSDF and the original polygons are
+   both cropped to the *cropping marker*: the expanded marker shrunk by
+   ``rf_erosion_px × grid_res_nm_per_px`` on every side, where
+   ``rf_erosion_px = c`` (encoder RF radius from the architecture
+   ``RF = 2c + 1``).
+6. **Metrics** — area difference ratio on the cropped masks; write
+   ``<output-dir>/results.csv`` and ``<output-dir>/summary.json``.
 
 Usage::
 
     python eval/evaluate.py \\
         --checkpoint checkpoints/baseline_v1/best.pt \\
         --config     train/config/baseline.yaml \\
-        --data-dir   dataset/raw/test/ \\
         --output-dir eval/results/baseline_v1/ \\
-        --device     cuda
+        --device     cuda \\
+        --split      test
 """
 
 from __future__ import annotations
 
 import argparse
 import logging
+import math
 import sys
 import time
+from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
@@ -44,6 +53,8 @@ sys.path.insert(0, str(_PROJECT_ROOT / "io"))
 
 from codec.model import CurveCodec
 from contouring.contour import csdf_to_contours
+from csdf.csdf_utils import rasterize_canvas
+from dataset.rasterize import _dbu_to_nm, _poly_to_pwcl, _shape_to_polygon
 from eval.metrics import area_difference_ratio, compression_ratio
 from eval.report import write_results_csv, write_summary_json
 from layout_io import read_polygons_in_region, write_oas
@@ -55,7 +66,27 @@ log = logging.getLogger(__name__)
 _DATASET_DIR = _PROJECT_ROOT / "dataset"
 
 
-# ─── Helpers ─────────────────────────────────────────────────────────────────
+# ─── Architecture helpers ─────────────────────────────────────────────────────
+
+
+def _patch_size_px(size_nm: float, grid_res: float, c: int) -> int:
+    """Pixel side-length for a region of *size_nm*, rounded up to a multiple of *c*."""
+    s = math.ceil(size_nm / grid_res)
+    rem = s % c
+    return s + (c - rem) % c
+
+
+def _rf_erosion_px(config: dict[str, Any]) -> int:
+    """Encoder RF erosion radius in image-space pixels.
+
+    Encoder architecture: stem Conv(3×3, pad=1) + N×DownBlock Conv(3×3,
+    stride=2, pad=1).  The total receptive field is RF = 2c + 1, so the
+    erosion radius (pixels contaminated by zero-padding at each edge) is c.
+    """
+    return int(config["model"]["compaction_ratio"])
+
+
+# ─── Config / manifest ────────────────────────────────────────────────────────
 
 
 def _load_config(path: Path) -> dict[str, Any]:
@@ -63,136 +94,208 @@ def _load_config(path: Path) -> dict[str, Any]:
         return yaml.safe_load(f)
 
 
-def _load_checkpoint(path: Path, device: torch.device) -> dict[str, Any]:
-    return torch.load(path, map_location=device)
+def _load_manifest(cache_dir: Path) -> dict[str, Any]:
+    """Load ``cache/manifest.yaml`` written by dataset/rasterize.py."""
+    manifest_path = cache_dir / "manifest.yaml"
+    if not manifest_path.exists():
+        raise FileNotFoundError(
+            f"manifest.yaml not found at {manifest_path}. "
+            "Run dataset/rasterize.py first to generate it."
+        )
+    with open(manifest_path) as f:
+        return yaml.safe_load(f)
 
 
-def _load_test_rows(config: dict[str, Any]) -> list[dict[str, Any]]:
-    """Return catalog rows for the test split."""
+# ─── Catalog helpers ─────────────────────────────────────────────────────────
+
+
+def _load_split_rows(config: dict[str, Any], split: str) -> list[dict[str, Any]]:
+    """Return catalog rows for the given split."""
     catalog_path = _DATASET_DIR / "catalog.csv"
     from dataset.ingest import load_catalog
 
     all_rows = load_catalog(catalog_path)
-    rows = [r for r in all_rows if r["split"] == "test"]
-    log.info("Test split: %d file(s) in catalog", len(rows))
+    rows = [r for r in all_rows if r["split"] == split]
+    log.info("%s split: %d file(s) in catalog", split, len(rows))
     return rows
 
 
-def _load_markers(row: dict[str, Any], config: dict[str, Any]) -> list[dict[str, Any]]:
-    """Load per-marker metadata from the cache sidecar YAML.
+# ─── Rasterization (fresh from raw OASIS) ────────────────────────────────────
 
-    Falls back to scanning the raw OASIS file if the sidecar is absent.
+
+def _rasterize_file_expanded(
+    oas_path: Path,
+    mask_layer: int,
+    marker_layer: int,
+    grid_res: float,
+    truncation_px: float,
+    margin_nm: float,
+    c: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], np.ndarray, float]:
+    """Load a raw OASIS file and rasterize expanded-marker cSDF patches.
+
+    For every square marker on *marker_layer*, the bounding box is enlarged by
+    *margin_nm* on all four sides.  The expanded patch size is rounded up to a
+    multiple of *c* so the encoder can process it without remainder.
+
+    A single ``rasterize_canvas`` call handles all markers in the file; the
+    per-marker patches are then cropped from the resulting canvas.
+
+    Args:
+        oas_path: Path to the raw OASIS file.
+        mask_layer: GDS layer of mask polygons.
+        marker_layer: GDS layer of square marker shapes.
+        grid_res: nm per pixel.
+        truncation_px: cSDF truncation half-width in pixels.
+        margin_nm: Expansion distance on each side (nm).
+        c: Compaction ratio (must be a power of 2).
+
+    Returns:
+        orig_markers: Original marker dicts (``x_nm``, ``y_nm``, ``size_nm``).
+        expanded_markers: Expanded marker dicts (``x_nm``, ``y_nm``, ``size_nm``
+            in nm, where ``size_nm = S_exp * grid_res``).
+        patches: ``float32 [N, S_exp, S_exp]`` cSDF patches.
+        dbu_um: Layout DBU in µm (e.g. ``0.001`` for 1 nm grid).  Must be
+            forwarded to ``write_oas`` so output coordinates match the source.
     """
-    cache_dir = _PROJECT_ROOT / config["dataset"]["cache_dir"]
-    from dataset.rasterize import meta_path
-
-    meta_file = meta_path(row, cache_dir)
-    if meta_file.exists():
-        with open(meta_file) as f:
-            meta = yaml.safe_load(f)
-        return meta.get("markers", [])
-
-    # Fallback: scan the raw OASIS file for square markers
-    log.warning(
-        "Cache sidecar not found for %s — scanning raw OASIS file", row["file"]
-    )
     import klayout.db as db
 
-    oas_abs = _PROJECT_ROOT / row["file"]
-    if not oas_abs.exists():
-        log.error("Raw OASIS not found: %s", oas_abs)
-        return []
-
     layout = db.Layout()
-    layout.read(str(oas_abs))
+    layout.read(str(oas_path))
     dbu_um: float = layout.dbu
-    marker_li = layout.layer(int(config["csdf"]["marker_layer"]), 0)
-    markers = []
+    mask_li = layout.layer(mask_layer, 0)
+    marker_li = layout.layer(marker_layer, 0)
+
+    # ── Collect square markers ────────────────────────────────────────────────
+    raw_markers: list[tuple[db.Box, float, float, float]] = []  # box, x_nm, y_nm, size_nm
+    layout_bbox = db.Box()
+
     for cell in layout.each_cell():
         for shape in cell.shapes(marker_li).each():
             if not shape.is_box():
                 continue
             box = shape.box
-            w_nm = box.width() * dbu_um * 1000.0
-            h_nm = box.height() * dbu_um * 1000.0
+            w_nm = _dbu_to_nm(box.width(), dbu_um)
+            h_nm = _dbu_to_nm(box.height(), dbu_um)
             if abs(w_nm - h_nm) > 0.5:
                 continue
-            markers.append(
-                {
-                    "x_nm": box.left * dbu_um * 1000.0,
-                    "y_nm": box.bottom * dbu_um * 1000.0,
-                    "size_nm": w_nm,
-                }
+            raw_markers.append((
+                box,
+                _dbu_to_nm(box.left,   dbu_um),
+                _dbu_to_nm(box.bottom, dbu_um),
+                w_nm,
+            ))
+            layout_bbox += box
+
+    if not raw_markers:
+        return [], [], np.zeros((0, 0, 0), dtype=np.float32), dbu_um
+
+    # ── Group mask polygons by marker (centroid-in-box rule) ──────────────────
+    marker_contours: dict[int, list] = defaultdict(list)
+
+    for cell in layout.each_cell():
+        for shape in cell.shapes(mask_li).each():
+            poly = _shape_to_polygon(shape)
+            if poly is None:
+                continue
+            hull_pts = list(poly.each_point_hull())
+            if not hull_pts:
+                continue
+            centroid = db.Point(
+                sum(pt.x for pt in hull_pts) // len(hull_pts),
+                sum(pt.y for pt in hull_pts) // len(hull_pts),
             )
-    return markers
+            for m_idx, (box, *_) in enumerate(raw_markers):
+                if box.contains(centroid):
+                    marker_contours[m_idx].extend(_poly_to_pwcl(poly, dbu_um))
+                    break
 
+    valid_indices = [i for i in range(len(raw_markers)) if i in marker_contours]
+    if not valid_indices:
+        return [], [], np.zeros((0, 0, 0), dtype=np.float32), dbu_um
 
-def _load_patches(
-    row: dict[str, Any],
-    markers: list[dict[str, Any]],
-    config: dict[str, Any],
-) -> np.ndarray:
-    """Load cSDF patches for all markers of one OASIS file.
+    # ── Canvas dimensions sized for the natural (un-rounded) expanded patches ───
+    # s_nat = ceil((size + 2*margin) / grid_res) — no c-rounding, matches rasterize.py.
+    # s_exp = s_nat rounded up to multiple of c — required by the encoder.
+    # The canvas must cover s_nat; s_exp - s_nat <= c-1 < c = rf_erosion, so the
+    # zero-padding added below is always removed by the rf-erosion crop.
+    canvas_x0_nm = _dbu_to_nm(layout_bbox.left,   dbu_um) - margin_nm
+    canvas_y0_nm = _dbu_to_nm(layout_bbox.bottom, dbu_um) - margin_nm
+    canvas_W = math.ceil(
+        (_dbu_to_nm(layout_bbox.width(),  dbu_um) + 2.0 * margin_nm) / grid_res
+    )
+    canvas_H = math.ceil(
+        (_dbu_to_nm(layout_bbox.height(), dbu_um) + 2.0 * margin_nm) / grid_res
+    )
 
-    Returns:
-        float32 numpy array ``[N, S, S]``.
-    """
-    from dataset.dataset import CsdfDataset
+    # ── Batch: use s_nat so patch size matches canvas dimensions ─────────────
+    # Passing s_exp here would make rasterize_canvas try to write pixels beyond
+    # the canvas right/top boundary, silently clipping the top and right edges.
+    batch = []
+    s_nat_per_marker: list[int] = []
+    s_exp_per_marker: list[int] = []
+    for m_idx in valid_indices:
+        _, mx_nm, my_nm, msize_nm = raw_markers[m_idx]
+        s_nat = math.ceil((msize_nm + 2.0 * margin_nm) / grid_res)
+        s_exp = _patch_size_px(msize_nm + 2.0 * margin_nm, grid_res, c)
+        batch.append((marker_contours[m_idx], mx_nm - margin_nm, my_nm - margin_nm, s_nat))
+        s_nat_per_marker.append(s_nat)
+        s_exp_per_marker.append(s_exp)
 
-    # Re-use dataset logic: build a temporary single-file dataset
-    mode = config["dataset"]["mode"]
-    if mode == "cached":
-        cache_dir = _PROJECT_ROOT / config["dataset"]["cache_dir"]
-        from dataset.rasterize import npy_path, meta_path
-
-        canvas_file = npy_path(row, cache_dir)
-        meta_file = meta_path(row, cache_dir)
-        if not canvas_file.exists() or not meta_file.exists():
-            raise FileNotFoundError(
-                f"Cache missing for {row['file']} — run dataset/rasterize.py first."
+    # Verify canvas covers every natural expanded patch (catches sizing bugs).
+    canvas_right_nm = canvas_x0_nm + canvas_W * grid_res
+    canvas_top_nm   = canvas_y0_nm + canvas_H * grid_res
+    for m_idx, s_nat in zip(valid_indices, s_nat_per_marker):
+        _, mx_nm, my_nm, msize_nm = raw_markers[m_idx]
+        exp_right_nm = mx_nm - margin_nm + s_nat * grid_res
+        exp_top_nm   = my_nm - margin_nm + s_nat * grid_res
+        if canvas_right_nm < exp_right_nm - 0.5 or canvas_top_nm < exp_top_nm - 0.5:
+            raise RuntimeError(
+                f"Canvas [{canvas_x0_nm:.1f},{canvas_y0_nm:.1f} + "
+                f"{canvas_W}×{canvas_H} px] does not cover expanded marker "
+                f"right={exp_right_nm:.1f} nm / top={exp_top_nm:.1f} nm for "
+                f"{oas_path.name} marker idx {m_idx}."
             )
-        canvas = np.load(canvas_file)
-        with open(meta_file) as f:
-            meta = yaml.safe_load(f)
 
-        x0_nm = float(meta["canvas_x0_nm"])
-        y0_nm = float(meta["canvas_y0_nm"])
-        grid_res = float(config["csdf"]["grid_res_nm_per_px"])
-        S = int(row["patch_size_px"])
+    canvas = rasterize_canvas(
+        batch,
+        canvas_x0_nm=canvas_x0_nm,
+        canvas_y0_nm=canvas_y0_nm,
+        canvas_H=canvas_H,
+        canvas_W=canvas_W,
+        grid_res_nm_per_px=grid_res,
+        truncation_px=truncation_px,
+    )
 
-        patches = []
-        for m in markers:
-            col0 = round((m["x_nm"] - x0_nm) / grid_res)
-            row0 = round((m["y_nm"] - y0_nm) / grid_res)
-            patch = canvas[row0 : row0 + S, col0 : col0 + S]
-            if patch.shape != (S, S):
-                raise RuntimeError(
-                    f"Patch shape {patch.shape} != ({S}, {S}) for "
-                    f"{Path(row['file']).name} marker ({m['x_nm']:.1f}, {m['y_nm']:.1f}) nm"
-                )
-            patches.append(patch)
-        return np.stack(patches, axis=0)  # [N, S, S]
+    # ── Crop per-marker patches from canvas, then zero-pad to s_exp ──────────
+    # Zero-padding is applied at the right and top (high indices).  Because
+    # s_exp - s_nat <= c-1 < c = rf_erosion, the padded pixels are always
+    # inside the rf-erosion border and are removed before the ADR crop.
+    orig_markers_out:     list[dict[str, Any]] = []
+    expanded_markers_out: list[dict[str, Any]] = []
+    patches:              list[np.ndarray]     = []
 
-    # on_the_fly mode: use the dataset _rasterize_on_the_fly logic
-    # Build a minimal temporary dataset just for this file
-    ds = CsdfDataset.__new__(CsdfDataset)
-    ds._split = row["split"]
-    ds._mode = "on_the_fly"
-    ds._grid_res = float(config["csdf"]["grid_res_nm_per_px"])
-    ds._truncation_px = float(config["csdf"]["truncation_px"])
-    ds._mask_layer = int(config["csdf"]["mask_layer"])
-    ds._marker_layer = int(config["csdf"]["marker_layer"])
-    ds._cache_dir = _PROJECT_ROOT / config["dataset"]["cache_dir"]
-    ds._raw_dir = _PROJECT_ROOT / config["paths"]["dataset_root"]
-    ds._layout_cache: dict[str, Any] = {}
-    ds._rows = [row]
-    ds._items = [(row, m) for m in markers]
+    for m_idx, s_nat, s_exp in zip(valid_indices, s_nat_per_marker, s_exp_per_marker):
+        _, mx_nm, my_nm, msize_nm = raw_markers[m_idx]
+        exp_x_nm = mx_nm - margin_nm
+        exp_y_nm = my_nm - margin_nm
 
-    patches = []
-    for m in markers:
-        patch = ds._rasterize_on_the_fly(row, m)
+        col0 = round((exp_x_nm - canvas_x0_nm) / grid_res)
+        row0 = round((exp_y_nm - canvas_y0_nm) / grid_res)
+        patch_nat = canvas[row0: row0 + s_nat, col0: col0 + s_nat]
+
+        if s_exp > s_nat:
+            patch = np.zeros((s_exp, s_exp), dtype=np.float32)
+            patch[: patch_nat.shape[0], : patch_nat.shape[1]] = patch_nat
+        else:
+            patch = patch_nat
+
+        orig_markers_out.append({"x_nm": mx_nm,    "y_nm": my_nm,    "size_nm": msize_nm})
+        expanded_markers_out.append({"x_nm": exp_x_nm, "y_nm": exp_y_nm, "size_nm": s_exp * grid_res})
         patches.append(patch)
-    return np.stack(patches, axis=0)  # [N, S, S]
+
+    patches_arr = np.stack(patches, axis=0)  # [N, S_exp, S_exp]
+    return orig_markers_out, expanded_markers_out, patches_arr, dbu_um
 
 
 # ─── Encode pass ─────────────────────────────────────────────────────────────
@@ -200,7 +303,7 @@ def _load_patches(
 
 def encode_file(
     row: dict[str, Any],
-    markers: list[dict[str, Any]],
+    expanded_markers: list[dict[str, Any]],
     patches_np: np.ndarray,
     model: CurveCodec,
     device: torch.device,
@@ -208,30 +311,30 @@ def encode_file(
     dna_dir: Path,
     checkpoint_path: Path,
 ) -> tuple[Path, float]:
-    """Encode all patches of one OASIS file → ``.cdna``.
+    """Encode expanded-marker patches → ``.cdna``.
 
     Args:
         row: Catalog row dict.
-        markers: Per-marker metadata dicts.
-        patches_np: float32 array ``[N, S, S]``.
-        model: Loaded CurveCodec in eval mode.
+        expanded_markers: Expanded marker dicts (``x_nm``, ``y_nm``,
+            ``size_nm``), one per patch.
+        patches_np: ``float32 [N, S_exp, S_exp]`` cSDF patches.
+        model: CurveCodec in eval mode.
         device: Target device.
         config: YAML config dict.
         dna_dir: Output directory for ``.cdna`` files.
-        checkpoint_path: Used for checkpoint_hash in meta.json.
+        checkpoint_path: Used to embed a fingerprint in ``meta.json``.
 
     Returns:
-        ``(cdna_path, encode_ms)`` — path to the saved archive and wall-clock
-        encode time in milliseconds.
+        ``(cdna_path, encode_ms)``
     """
     stem = Path(row["file"]).stem
     cdna_path = dna_dir / f"{stem}.cdna"
 
-    x = torch.from_numpy(patches_np[:, None, :, :]).to(device)  # [N, 1, S, S]
+    x = torch.from_numpy(patches_np[:, None, :, :]).to(device)  # [N, 1, S_exp, S_exp]
 
     t0 = time.perf_counter()
     with torch.no_grad():
-        dna_tensor = model.export_dna(x)  # [N, D, Sc, Sc]  int8/int16
+        dna_tensor = model.export_dna(x)  # [N, D, S_exp/c, S_exp/c]
     encode_ms = (time.perf_counter() - t0) * 1000.0
 
     save_cdna(
@@ -239,106 +342,127 @@ def encode_file(
         dna=dna_tensor,
         config=config,
         scale_factors=model.quantizer.scale_factors,
-        markers=markers,
+        markers=expanded_markers,
         checkpoint_path=checkpoint_path,
     )
-    log.debug("Encode: %s  N=%d  %.1f ms → %s", stem, len(markers), encode_ms, cdna_path)
+    log.debug("Encode: %s  N=%d  %.1f ms → %s", stem, len(expanded_markers), encode_ms, cdna_path)
     return cdna_path, encode_ms
 
 
-# ─── Decode pass ─────────────────────────────────────────────────────────────
+# ─── Decode + crop pass ──────────────────────────────────────────────────────
 
 
 def decode_file(
     cdna_path: Path,
+    oas_path: Path,
     model: CurveCodec,
     device: torch.device,
+    config: dict[str, Any],
     recon_dir: Path,
     orig_dir: Path,
-    oas_path: Path,
-    config: dict[str, Any],
+    rf_erosion: int,
+    dbu_um: float,
 ) -> tuple[list[Path], list[Path], float]:
-    """Decode ``.cdna`` → reconstructed per-marker OASIS files.
+    """Decode ``.cdna`` → reconstructed per-marker OASIS files (cropped).
 
-    Loads the archive from disk (no in-memory shortcuts), dequantizes,
-    decodes each patch, extracts contours, and writes one ``.oas`` per
-    marker.  Also extracts the corresponding original polygons and writes
-    them alongside for metric comparison.
+    Loads the archive from disk, dequantizes, decodes, then crops both the
+    reconstructed cSDF and the original polygon set to the *cropping marker*
+    (expanded marker shrunk by ``rf_erosion`` pixels on every side) before
+    contouring and writing ``.oas`` files.  This removes unreliable
+    boundary pixels from the ADR computation.
 
     Args:
-        cdna_path: Path to the ``.cdna`` archive.
+        cdna_path: Path to the ``.cdna`` archive (expanded-marker encoding).
+        oas_path: Original OASIS file for polygon extraction.
         model: CurveCodec in eval mode.
         device: Target device.
+        config: YAML config dict.
         recon_dir: Output directory for reconstructed ``.oas`` files.
         orig_dir: Output directory for extracted-original ``.oas`` files.
-        oas_path: Original OASIS file (for polygon extraction).
-        config: YAML config dict.
+        rf_erosion: Pixels to remove from each edge before ADR
+            (``= compaction_ratio``).
+        dbu_um: Layout DBU in µm, read from the source OASIS file.  Applied
+            to both reconstructed and extracted-original ``.oas`` outputs so
+            coordinates round to the same grid as the source.
 
     Returns:
-        ``(recon_paths, orig_paths, decode_ms)`` — per-marker reconstructed
-        and extracted-original paths, and total decode wall-clock time in ms.
+        ``(recon_paths, orig_paths, decode_ms)``
     """
-    dna, meta = load_cdna(cdna_path)  # load from disk
+    dna, meta = load_cdna(cdna_path)
 
     z = dequantize(dna, meta["scale_factors"]).to(device)  # [N, D, Sc, Sc]
 
     t0 = time.perf_counter()
     with torch.no_grad():
-        x_hat = model.decode(z)  # [N, 1, S, S]
+        x_hat = model.decode(z)  # [N, 1, S_exp, S_exp]
     decode_ms = (time.perf_counter() - t0) * 1000.0
 
-    x_hat_np = x_hat.cpu().numpy()[:, 0, :, :]  # [N, S, S]
+    x_hat_np = x_hat.cpu().numpy()[:, 0, :, :]  # [N, S_exp, S_exp]
 
-    grid_res = float(config["csdf"]["grid_res_nm_per_px"])
+    grid_res  = float(config["csdf"]["grid_res_nm_per_px"])
     mask_layer = int(config["csdf"]["mask_layer"])
     stem = cdna_path.stem
+    rf_nm = rf_erosion * grid_res
 
     recon_paths: list[Path] = []
-    orig_paths: list[Path] = []
+    orig_paths:  list[Path] = []
 
     for i, marker in enumerate(meta["markers"]):
-        csdf_patch = x_hat_np[i]  # [S, S]
+        # Expanded marker origin and size (stored in .cdna meta.json)
+        exp_x_nm   = float(marker["x_nm"])
+        exp_y_nm   = float(marker["y_nm"])
+        exp_size_nm = float(marker["size_nm"])
 
-        # Contour in physical nm
+        # Cropping marker: shrink expanded marker by rf_erosion on every side
+        crop_x0_nm = exp_x_nm   + rf_nm
+        crop_y0_nm = exp_y_nm   + rf_nm
+        crop_size_nm = exp_size_nm - 2.0 * rf_nm
+
+        if crop_size_nm <= 0:
+            log.warning(
+                "Cropping marker has non-positive size (%.1f nm) for %s m%d — skipping",
+                crop_size_nm, stem, i,
+            )
+            continue
+
+        # Crop reconstructed cSDF to the cropping marker
+        csdf_full = x_hat_np[i]  # [S_exp, S_exp]
+        rf = rf_erosion
+        csdf_crop = csdf_full[rf: csdf_full.shape[0] - rf,
+                               rf: csdf_full.shape[1] - rf]
+
+        # Contour in physical nm using the cropping-marker origin
         contours = csdf_to_contours(
-            csdf=csdf_patch.astype(np.float32),
-            origin_x_nm=float(marker["x_nm"]),
-            origin_y_nm=float(marker["y_nm"]),
+            csdf=csdf_crop.astype(np.float32),
+            origin_x_nm=crop_x0_nm,
+            origin_y_nm=crop_y0_nm,
             grid_res_nm_per_px=grid_res,
         )
 
-        # Reconstruct hull point lists from PwclContour objects
         recon_hulls: list[list[tuple[float, float]]] = []
         for contour in contours:
-            pts: list[tuple[float, float]] = []
-            for seg in contour.segments:
-                pts.append(seg.pts[0])
+            pts: list[tuple[float, float]] = [seg.pts[0] for seg in contour.segments]
             if pts:
                 recon_hulls.append(pts)
 
-        # Write reconstructed .oas
         recon_path = recon_dir / f"{stem}_m{i:04d}.oas"
-        write_oas(recon_path, recon_hulls, mask_layer=mask_layer)
+        write_oas(recon_path, recon_hulls, mask_layer=mask_layer, dbu=dbu_um)
         recon_paths.append(recon_path)
 
-        # Extract original polygons within this marker region and write .oas
-        x0 = float(marker["x_nm"])
-        y0 = float(marker["y_nm"])
-        size = float(marker["size_nm"])
+        # Extract original polygons within the cropping marker region
         orig_hulls = read_polygons_in_region(
             oas_path=oas_path,
             mask_layer=mask_layer,
-            x0_nm=x0, y0_nm=y0,
-            x1_nm=x0 + size, y1_nm=y0 + size,
+            x0_nm=crop_x0_nm,
+            y0_nm=crop_y0_nm,
+            x1_nm=crop_x0_nm + crop_size_nm,
+            y1_nm=crop_y0_nm + crop_size_nm,
         )
         orig_path = orig_dir / f"{stem}_m{i:04d}.oas"
-        write_oas(orig_path, orig_hulls, mask_layer=mask_layer)
+        write_oas(orig_path, orig_hulls, mask_layer=mask_layer, dbu=dbu_um)
         orig_paths.append(orig_path)
 
-    log.debug(
-        "Decode: %s  N=%d  %.1f ms",
-        cdna_path.name, len(meta["markers"]), decode_ms,
-    )
+    log.debug("Decode: %s  N=%d  %.1f ms", cdna_path.name, len(meta["markers"]), decode_ms)
     return recon_paths, orig_paths, decode_ms
 
 
@@ -347,7 +471,7 @@ def decode_file(
 
 def compute_metrics(
     row: dict[str, Any],
-    markers: list[dict[str, Any]],
+    orig_markers: list[dict[str, Any]],
     oas_path: Path,
     cdna_path: Path,
     recon_paths: list[Path],
@@ -360,11 +484,11 @@ def compute_metrics(
 
     Args:
         row: Catalog row dict.
-        markers: Per-marker metadata dicts.
-        oas_path: Original OASIS file (for compression_ratio).
+        orig_markers: Original (unexpanded) marker dicts.
+        oas_path: Original OASIS file (for ``compression_ratio``).
         cdna_path: Encoded ``.cdna`` file.
-        recon_paths: Per-marker reconstructed ``.oas`` paths.
-        orig_paths: Per-marker extracted-original ``.oas`` paths.
+        recon_paths: Per-marker reconstructed ``.oas`` paths (cropped).
+        orig_paths: Per-marker extracted-original ``.oas`` paths (cropped).
         encode_ms: Encode wall-clock time for this file (ms).
         decode_ms: Decode wall-clock time for this file (ms).
         mask_layer: GDS layer of mask polygons.
@@ -373,14 +497,13 @@ def compute_metrics(
         List of result dicts, one per marker.
     """
     cr = compression_ratio(oas_path, cdna_path)
-    n = len(markers)
-    # Distribute encode/decode time equally across markers
+    n = len(orig_markers)
     enc_per = encode_ms / max(n, 1)
     dec_per = decode_ms / max(n, 1)
 
     results: list[dict[str, Any]] = []
     for i, (marker, recon_path, orig_path) in enumerate(
-        zip(markers, recon_paths, orig_paths)
+        zip(orig_markers, recon_paths, orig_paths)
     ):
         try:
             adr = area_difference_ratio(orig_path, recon_path, mask_layer=mask_layer)
@@ -388,18 +511,16 @@ def compute_metrics(
             log.warning("area_difference_ratio failed for %s m%d: %s", row["file"], i, exc)
             adr = float("nan")
 
-        results.append(
-            {
-                "file": row["file"],
-                "marker_idx": i,
-                "marker_x_nm": float(marker["x_nm"]),
-                "marker_y_nm": float(marker["y_nm"]),
-                "compression_ratio": round(cr, 4),
-                "area_difference_ratio": round(adr, 6) if not np.isnan(adr) else None,
-                "encode_ms": round(enc_per, 2),
-                "decode_ms": round(dec_per, 2),
-            }
-        )
+        results.append({
+            "file":                  row["file"],
+            "marker_idx":            i,
+            "marker_x_nm":           float(marker["x_nm"]),
+            "marker_y_nm":           float(marker["y_nm"]),
+            "compression_ratio":     round(cr, 4),
+            "area_difference_ratio": round(adr, 6) if not np.isnan(adr) else None,
+            "encode_ms":             round(enc_per, 2),
+            "decode_ms":             round(dec_per, 2),
+        })
     return results
 
 
@@ -411,8 +532,9 @@ def evaluate(
     config: dict[str, Any],
     output_dir: Path,
     device: torch.device,
+    split: str = "test",
 ) -> None:
-    """Run the full encode → decode → metrics pipeline on the test split.
+    """Run the full encode → decode → metrics pipeline on a dataset split.
 
     Args:
         checkpoint_path: Path to the ``.pt`` checkpoint.
@@ -420,6 +542,7 @@ def evaluate(
         output_dir: Root output directory; subdirs ``dna/``,
                     ``reconstructed/``, and ``original/`` are created.
         device: PyTorch device.
+        split: Dataset split — ``"train"``, ``"validation"``, or ``"test"``.
     """
     dna_dir   = output_dir / "dna"
     recon_dir = output_dir / "reconstructed"
@@ -429,7 +552,6 @@ def evaluate(
 
     # ── Load model ────────────────────────────────────────────────────────────
     ckpt = torch.load(checkpoint_path, map_location=device)
-    # Use config from checkpoint so model architecture is always consistent
     ckpt_cfg: dict[str, Any] = ckpt.get("config", config)
     model = CurveCodec(ckpt_cfg).to(device)
     model.load_state_dict(ckpt["model_state_dict"])
@@ -440,49 +562,68 @@ def evaluate(
         ckpt.get("best_val_loss", float("nan")),
     )
 
-    mask_layer = int(config["csdf"]["mask_layer"])
+    # ── Read manifest for marker_margin_nm ───────────────────────────────────
+    cache_dir = _PROJECT_ROOT / config["dataset"]["cache_dir"]
+    manifest  = _load_manifest(cache_dir)
+    margin_nm = float(manifest.get("marker_margin_nm", config["csdf"].get("marker_margin_nm", 0.0)))
+    log.info("marker_margin_nm = %.1f nm (from manifest)", margin_nm)
 
-    # ── Test catalog rows ─────────────────────────────────────────────────────
-    test_rows = _load_test_rows(config)
-    if not test_rows:
+    # ── Derived parameters ────────────────────────────────────────────────────
+    grid_res     = float(config["csdf"]["grid_res_nm_per_px"])
+    truncation_px = float(config["csdf"]["truncation_px"])
+    mask_layer   = int(config["csdf"]["mask_layer"])
+    marker_layer = int(config["csdf"]["marker_layer"])
+    c            = int(ckpt_cfg["model"]["compaction_ratio"])
+    rf_erosion   = _rf_erosion_px(ckpt_cfg)
+    log.info("compaction_ratio=%d  rf_erosion=%d px  (%.1f nm)", c, rf_erosion, rf_erosion * grid_res)
+
+    # ── Catalog rows ──────────────────────────────────────────────────────────
+    split_rows = _load_split_rows(config, split)
+    if not split_rows:
         log.error(
-            "No test rows found in catalog.csv.  "
-            "Run dataset/ingest.py with --split test first."
+            "No rows found for split '%s' in catalog.csv.  "
+            "Run dataset/ingest.py with --split %s first.",
+            split, split,
         )
         return
 
     all_results: list[dict[str, Any]] = []
 
-    for row_idx, row in enumerate(test_rows):
+    for row_idx, row in enumerate(split_rows):
         stem = Path(row["file"]).stem
         oas_path = _PROJECT_ROOT / row["file"]
         if not oas_path.exists():
             log.warning("OASIS not found, skipping: %s", oas_path)
             continue
 
-        log.info(
-            "[%d/%d] %s",
-            row_idx + 1, len(test_rows), row["file"],
-        )
+        log.info("[%d/%d] %s", row_idx + 1, len(split_rows), row["file"])
 
-        # ── Load markers ──────────────────────────────────────────────────────
-        markers = _load_markers(row, config)
-        if not markers:
+        # ── Step 1: Read + expand + rasterize ────────────────────────────────
+        try:
+            orig_markers, expanded_markers, patches_np, dbu_um = _rasterize_file_expanded(
+                oas_path=oas_path,
+                mask_layer=mask_layer,
+                marker_layer=marker_layer,
+                grid_res=grid_res,
+                truncation_px=truncation_px,
+                margin_nm=margin_nm,
+                c=c,
+            )
+        except Exception as exc:
+            log.error("Rasterization failed for %s: %s", row["file"], exc)
+            continue
+
+        if not orig_markers:
             log.warning("No markers found for %s — skipping", row["file"])
             continue
 
-        # ── Load patches ──────────────────────────────────────────────────────
-        try:
-            patches_np = _load_patches(row, markers, config)
-        except Exception as exc:
-            log.error("Failed to load patches for %s: %s", row["file"], exc)
-            continue
+        log.debug("  markers=%d  S_exp=%d", len(orig_markers), patches_np.shape[1])
 
-        # ── Step 1: Encode → .cdna ────────────────────────────────────────────
+        # ── Step 2: Encode → .cdna ────────────────────────────────────────────
         try:
             cdna_path, encode_ms = encode_file(
                 row=row,
-                markers=markers,
+                expanded_markers=expanded_markers,
                 patches_np=patches_np,
                 model=model,
                 device=device,
@@ -494,25 +635,31 @@ def evaluate(
             log.error("Encode failed for %s: %s", row["file"], exc)
             continue
 
-        # ── Step 2: Decode .cdna → reconstructed .oas ─────────────────────────
+        # ── Step 3: Load .cdna → decode → crop → contour ─────────────────────
         try:
             recon_paths, orig_paths, decode_ms = decode_file(
                 cdna_path=cdna_path,
+                oas_path=oas_path,
                 model=model,
                 device=device,
+                config=config,
                 recon_dir=recon_dir,
                 orig_dir=orig_dir,
-                oas_path=oas_path,
-                config=config,
+                rf_erosion=rf_erosion,
+                dbu_um=dbu_um,
             )
         except Exception as exc:
             log.error("Decode failed for %s: %s", row["file"], exc)
             continue
 
-        # ── Step 3: Metrics ───────────────────────────────────────────────────
+        if not recon_paths:
+            log.warning("No valid decoded markers for %s — skipping metrics", row["file"])
+            continue
+
+        # ── Step 4: Metrics ───────────────────────────────────────────────────
         file_results = compute_metrics(
             row=row,
-            markers=markers,
+            orig_markers=orig_markers[: len(recon_paths)],
             oas_path=oas_path,
             cdna_path=cdna_path,
             recon_paths=recon_paths,
@@ -523,13 +670,12 @@ def evaluate(
         )
         all_results.extend(file_results)
 
-        # Per-file progress log
         crs  = [r["compression_ratio"] for r in file_results if r.get("compression_ratio")]
         adrs = [r["area_difference_ratio"] for r in file_results
                 if r.get("area_difference_ratio") is not None]
         log.info(
-            "  markers=%d  CR=%.2f  ADR_mean=%.4f  enc=%.1fms  dec=%.1fms",
-            len(markers),
+            "  markers=%d  CR=%.2f  ADR_mean=%.4f  enc=%.1f ms  dec=%.1f ms",
+            len(orig_markers),
             crs[0] if crs else float("nan"),
             float(np.nanmean(adrs)) if adrs else float("nan"),
             encode_ms,
@@ -542,9 +688,8 @@ def evaluate(
         all_results,
         output_dir / "summary.json",
         checkpoint_path=checkpoint_path,
-        n_files=len(test_rows),
+        n_files=len(split_rows),
     )
-
     log.info("Evaluation complete.  Output: %s", output_dir)
 
 
@@ -574,6 +719,11 @@ def parse_args() -> argparse.Namespace:
         "--device", type=str, default=None,
         help="PyTorch device (default: cuda if available, else cpu)",
     )
+    p.add_argument(
+        "--split", type=str, default="test",
+        choices=["train", "validation", "test"],
+        help="Dataset split to evaluate (default: test)",
+    )
     return p.parse_args()
 
 
@@ -591,10 +741,11 @@ def main() -> None:
 
     config = _load_config(args.config)
 
-    if args.device is not None:
-        device = torch.device(args.device)
-    else:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = (
+        torch.device(args.device)
+        if args.device is not None
+        else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    )
     log.info("Device: %s", device)
 
     evaluate(
@@ -602,6 +753,7 @@ def main() -> None:
         config=config,
         output_dir=args.output_dir,
         device=device,
+        split=args.split,
     )
 
 
