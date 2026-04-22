@@ -36,6 +36,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from codec.loss import ReconLoss
 from codec.model import CurveCodec
+from codec.model_v2 import CurveCodecV2
 from dataset.dataset import make_dataloaders
 
 log = logging.getLogger(__name__)
@@ -269,9 +270,13 @@ def train(cfg: dict[str, Any], device: torch.device, resume: bool = False) -> No
         del _warmup
 
     # ── Model ─────────────────────────────────────────────────────────────────
-    model = CurveCodec(cfg).to(device)
+    arch = cfg.get("model", {}).get("arch", "curve_codec")
+    _ARCH_MAP = {"curve_codec": CurveCodec, "curve_codec_v2": CurveCodecV2}
+    if arch not in _ARCH_MAP:
+        raise ValueError(f"model.arch must be one of {list(_ARCH_MAP)}, got '{arch}'")
+    model = _ARCH_MAP[arch](cfg).to(device)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    log.info("CurveCodec: %d trainable parameters", n_params)
+    log.info("%s: %d trainable parameters", arch, n_params)
 
     # ── Loss ──────────────────────────────────────────────────────────────────
     criterion = ReconLoss(cfg)

@@ -1,0 +1,32 @@
+{
+  "n_samples": 50,
+  "n_files": 50,
+  "compression_ratio_mean": 0.977744,
+  "compression_ratio_min": 0.9188,
+  "compression_ratio_max": 1.0244,
+  "compression_ratio_p95": 1.016575,
+  "area_difference_ratio_mean": 0.032677700000000004,
+  "area_difference_ratio_min": 0.022975,
+  "area_difference_ratio_max": 0.041613,
+  "area_difference_ratio_p95": 0.0408022,
+  "encode_ms_mean": 5.613800000000001,
+  "encode_ms_min": 0.91,
+  "encode_ms_max": 230.65,
+  "encode_ms_p95": 1.4349999999999992,
+  "decode_ms_mean": 1.3319999999999999,
+  "decode_ms_min": 0.7,
+  "decode_ms_max": 28.76,
+  "decode_ms_p95": 0.8554999999999999,
+  "checkpoint": "../checkpoints/baseline_v1/best.pt",
+  "model_version": "v1.0.0",
+  "targets": {
+    "compression_ratio_target": ">=10",
+    "area_difference_ratio_target": "<=0.02",
+    "encode_ms_gpu_target": "<=50",
+    "decode_ms_gpu_target": "<=100"
+  },
+  "targets_passed": {
+    "compression_ratio_ge10": false,
+    "area_difference_ratio_le002": false
+  }
+}

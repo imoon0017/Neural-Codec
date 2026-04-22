@@ -1,0 +1,37 @@
+model:
+  latent_dim: 8
+  compaction_ratio: 16
+  quantizer_bits: 16
+  encoder_channels: 64
+  arch: curve_codec_v2
+csdf:
+  grid_res_nm_per_px: 6.0
+  marker_layer: 100
+  mask_layer: 1
+  truncation_px: 5.0
+  marker_margin_nm: 100
+dataset:
+  mode: cached
+  cache_dir: dataset/cache/
+training:
+  batch_size: 4
+  epochs: 200
+  val_every_n_epochs: 1
+  optimizer: adamw
+  lr: 0.0001
+  weight_decay: 0.01
+  lr_scheduler: cosine
+  lr_min: 1.0e-06
+  warmup_epochs: 5
+  lr_step_size: 50
+  lr_step_gamma: 0.5
+  grad_clip: 1.0
+  num_workers: 2
+  loss:
+    recon: mse
+    huber_delta: 1.0
+    erosion_margin_px: 16
+paths:
+  dataset_root: dataset/raw/
+  checkpoint_dir: checkpoints/
+  run_id: v2_split_D8_c16_B16

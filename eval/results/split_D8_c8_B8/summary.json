@@ -1,0 +1,32 @@
+{
+  "n_samples": 50,
+  "n_files": 50,
+  "compression_ratio_mean": 3.480682,
+  "compression_ratio_min": 3.2713,
+  "compression_ratio_max": 3.6485,
+  "compression_ratio_p95": 3.613275,
+  "area_difference_ratio_mean": 0.03435572,
+  "area_difference_ratio_min": 0.026363,
+  "area_difference_ratio_max": 0.043383,
+  "area_difference_ratio_p95": 0.0416242,
+  "encode_ms_mean": 5.7548,
+  "encode_ms_min": 0.88,
+  "encode_ms_max": 239.86,
+  "encode_ms_p95": 1.2039999999999997,
+  "decode_ms_mean": 1.4614000000000003,
+  "decode_ms_min": 0.67,
+  "decode_ms_max": 38.21,
+  "decode_ms_p95": 0.7755,
+  "checkpoint": "/home/elicer/neural_codec/checkpoints/split_D8_c8_B8/best.pt",
+  "model_version": "v1.0.0",
+  "targets": {
+    "compression_ratio_target": ">=10",
+    "area_difference_ratio_target": "<=0.02",
+    "encode_ms_gpu_target": "<=50",
+    "decode_ms_gpu_target": "<=100"
+  },
+  "targets_passed": {
+    "compression_ratio_ge10": false,
+    "area_difference_ratio_le002": false
+  }
+}

@@ -52,6 +52,7 @@ sys.path.insert(0, str(_PROJECT_ROOT))
 sys.path.insert(0, str(_PROJECT_ROOT / "io"))
 
 from codec.model import CurveCodec
+from codec.model_v2 import CurveCodecV2
 from contouring.contour import csdf_to_contours
 from csdf.csdf_utils import rasterize_canvas
 from dataset.rasterize import _dbu_to_nm, _poly_to_pwcl, _shape_to_polygon
@@ -667,7 +668,11 @@ def evaluate(
     # ── Load model ────────────────────────────────────────────────────────────
     ckpt = torch.load(checkpoint_path, map_location=device)
     ckpt_cfg: dict[str, Any] = ckpt.get("config", config)
-    model = CurveCodec(ckpt_cfg).to(device)
+    arch = ckpt_cfg.get("model", {}).get("arch", "curve_codec")
+    _ARCH_MAP = {"curve_codec": CurveCodec, "curve_codec_v2": CurveCodecV2}
+    if arch not in _ARCH_MAP:
+        raise ValueError(f"model.arch must be one of {list(_ARCH_MAP)}, got '{arch}'")
+    model = _ARCH_MAP[arch](ckpt_cfg).to(device)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
     log.info(

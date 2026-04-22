@@ -1,0 +1,80 @@
+CurveCodecV2  (D=32, c=8, C=64, B=16)
+════════════════════════════════════════════════════════════════════════
+                                        input [B, 1, S, S]
+════════════════════════════════════════════════════════════════════════
+ENCODER  EncoderAA                                          115,488 params
+────────────────────────────────────────────────────────────────────────
+  Stem
+    Conv2d(1→64, 3×3, s=1, no bias)                              576
+    GroupNorm(groups=8, C=64)                                     128
+    GELU
+                                        [B, 64, S, S]
+
+  DownBlock × 3   (one per factor-of-2, N = log₂(c) = 3)
+  ┌─────────────────────────────────────────────────────────────────
+  │  Conv2d(64→64, 3×3, s=1, no bias)    spatial feat + ch mix  36,864
+  │  GroupNorm(groups=8, C=64)                                      128
+  │  GELU
+  │                                      [B, 64, S/2^n, S/2^n]
+  │  DWConv2d(64→64, 3×3, s=2, groups=64, no bias)               576
+  │  (per-channel spatial low-pass + ×2 decimation)
+  │                                      [B, 64, S/2^(n+1), S/2^(n+1)]
+  └─────────────────────────────────────────────────────────────────
+    params per block: 37,568  ×3 blocks = 112,704
+
+  Projection
+    Conv2d(64→32, 1×1)                  channel squeeze         2,080
+                                        [B, 32, S/8, S/8]
+════════════════════════════════════════════════════════════════════════
+QUANTIZER  QuantizerLayer                                          32 params
+────────────────────────────────────────────────────────────────────────
+  per-channel log-scale  (32 learned scalars)
+  train : z_hat = round_STE(z / exp(s)) * exp(s)
+  eval  : z_hat = round(z / exp(s))     * exp(s)
+  export: q     = round(z / exp(s)).to(int16)
+                                        [B, 32, S/8, S/8]
+════════════════════════════════════════════════════════════════════════
+DECODER  DecoderTC                                          199,681 params
+────────────────────────────────────────────────────────────────────────
+  Expansion
+    Conv2d(32→64, 1×1)                  channel expand          2,112
+                                        [B, 64, S/8, S/8]
+
+  UpBlock × 3   (one per factor-of-2, N = log₂(c) = 3)
+  ┌─────────────────────────────────────────────────────────────────
+  │  ConvTranspose2d(64→64, 4×4, s=2, padding=1, no bias)       65,536
+  │  (learnable ×2 spatial upsample, no chessboard artefact)
+  │  GroupNorm(groups=8, C=64)                                      128
+  │  GELU
+  │                                      [B, 64, S/2^(N-n), S/2^(N-n)]
+  └─────────────────────────────────────────────────────────────────
+    params per block: 65,664  ×3 blocks = 196,992
+
+  Output head
+    Conv2d(64→1, 3×3)                                             577
+    Sigmoid  →  output ∈ [0, 1]
+                                        [B, 1, S, S]
+════════════════════════════════════════════════════════════════════════
+PARAMETER SUMMARY
+────────────────────────────────────────────────────────────────────────
+  Encoder (EncoderAA)       115,488
+  Quantizer                      32
+  Decoder (DecoderTC)       199,681
+  ─────────────────────────────────
+  Total                     315,201
+════════════════════════════════════════════════════════════════════════
+DESIGN NOTES
+────────────────────────────────────────────────────────────────────────
+  DownBlock  — decouples feature extraction (stride-1 Conv2d, full
+               cross-channel mixing) from spatial downsampling
+               (depthwise stride-2 Conv2d, per-channel spatial filter).
+               The depthwise conv has a single spatial job so training
+               pressure naturally drives it toward low-pass behaviour,
+               avoiding aliasing at the decimation step.
+
+  UpBlock    — 4×4 ConvTranspose2d (stride=2, padding=1) gives an exact
+               ×2 upsample with a learnable filter. Replaces PixelShuffle
+               which rearranges a fixed spatial block into channels and
+               produces chessboard artefacts when the mapping is not
+               perfectly learned.
+════════════════════════════════════════════════════════════════════════
