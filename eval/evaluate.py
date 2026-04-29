@@ -436,66 +436,48 @@ def _write_inspection_oas(
 # ─── Decode + crop pass ──────────────────────────────────────────────────────
 
 
-def decode_file(
-    cdna_path: Path,
+def _postprocess_per_marker(
+    x_hat_np: np.ndarray,
+    markers: list[dict[str, Any]],
     oas_path: Path,
-    model: CurveCodec,
-    device: torch.device,
     config: dict[str, Any],
     recon_dir: Path,
     orig_dir: Path,
     rf_erosion: int,
     dbu_um: float,
+    stem: str,
     inspect_dir: Path | None = None,
-) -> tuple[list[Path], list[Path], float]:
-    """Decode ``.cdna`` → reconstructed per-marker OASIS files (cropped).
+) -> tuple[list[Path], list[Path]]:
+    """Crop reconstructed cSDF and source polygons per marker; write ``.oas`` files.
 
-    Loads the archive from disk, dequantizes, decodes, then crops both the
-    reconstructed cSDF and the original polygon set to the *cropping marker*
-    (expanded marker shrunk by ``rf_erosion`` pixels on every side) before
-    contouring and writing ``.oas`` files.  This removes unreliable
-    boundary pixels from the ADR computation.
+    Shared post-processing used by both the ``.cdna`` (quantized) and
+    in-memory (no-quant) eval paths.
 
     Args:
-        cdna_path: Path to the ``.cdna`` archive (expanded-marker encoding).
-        oas_path: Original OASIS file for polygon extraction.
-        model: CurveCodec in eval mode.
-        device: Target device.
-        config: YAML config dict.
-        recon_dir: Output directory for reconstructed ``.oas`` files.
-        orig_dir: Output directory for extracted-original ``.oas`` files.
-        rf_erosion: Pixels to remove from each edge before ADR
-            (``= compaction_ratio``).
-        dbu_um: Layout DBU in µm, read from the source OASIS file.  Applied
-            to both reconstructed and extracted-original ``.oas`` outputs so
-            coordinates round to the same grid as the source.
-        inspect_dir: If not ``None``, write a 4-layer inspection ``.oas`` per
-            marker into this directory (original, reconstructed, XOR, valid
-            marker box on layers 1/2/3/10 respectively).
+        x_hat_np: Decoder output ``[N, S_exp, S_exp]`` in ``float32``.
+        markers: Expanded-marker dicts (``x_nm``, ``y_nm``, ``size_nm``),
+            length ``N``.
+        oas_path: Original OASIS file (used to re-extract polygons).
+        config: YAML config dict (reads ``csdf.grid_res_nm_per_px`` and
+            ``csdf.mask_layer``).
+        recon_dir: Output dir for per-marker reconstructed ``.oas``.
+        orig_dir: Output dir for per-marker extracted-original ``.oas``.
+        rf_erosion: Receptive-field erosion in pixels (= compaction_ratio).
+        dbu_um: Source layout DBU in µm.
+        stem: Filename stem (without ``.oas``) used for per-marker names.
+        inspect_dir: Optional 4-layer inspection ``.oas`` output dir.
 
     Returns:
-        ``(recon_paths, orig_paths, decode_ms)``
+        ``(recon_paths, orig_paths)``.
     """
-    dna, meta = load_cdna(cdna_path)
-
-    z = dequantize(dna, meta["scale_factors"]).to(device)  # [N, D, Sc, Sc]
-
-    t0 = time.perf_counter()
-    with torch.no_grad():
-        x_hat = model.decode(z)  # [N, 1, S_exp, S_exp]
-    decode_ms = (time.perf_counter() - t0) * 1000.0
-
-    x_hat_np = x_hat.cpu().numpy()[:, 0, :, :]  # [N, S_exp, S_exp]
-
-    grid_res  = float(config["csdf"]["grid_res_nm_per_px"])
+    grid_res   = float(config["csdf"]["grid_res_nm_per_px"])
     mask_layer = int(config["csdf"]["mask_layer"])
-    stem = cdna_path.stem
-    rf_nm = rf_erosion * grid_res
+    rf_nm      = rf_erosion * grid_res
 
     recon_paths: list[Path] = []
     orig_paths:  list[Path] = []
 
-    for i, marker in enumerate(meta["markers"]):
+    for i, marker in enumerate(markers):
         # Expanded marker origin and size (stored in .cdna meta.json)
         exp_x_nm   = float(marker["x_nm"])
         exp_y_nm   = float(marker["y_nm"])
@@ -564,8 +546,96 @@ def decode_file(
             except Exception as exc:
                 log.warning("Inspection write failed for %s m%d: %s", stem, i, exc)
 
+    return recon_paths, orig_paths
+
+
+def decode_file(
+    cdna_path: Path,
+    oas_path: Path,
+    model: CurveCodec,
+    device: torch.device,
+    config: dict[str, Any],
+    recon_dir: Path,
+    orig_dir: Path,
+    rf_erosion: int,
+    dbu_um: float,
+    inspect_dir: Path | None = None,
+) -> tuple[list[Path], list[Path], float]:
+    """Quantized eval path: ``.cdna`` → dequantize → decode → per-marker ``.oas``."""
+    dna, meta = load_cdna(cdna_path)
+    z = dequantize(dna, meta["scale_factors"]).to(device)  # [N, D, Sc, Sc]
+
+    t0 = time.perf_counter()
+    with torch.no_grad():
+        x_hat = model.decode(z)  # [N, 1, S_exp, S_exp]
+    decode_ms = (time.perf_counter() - t0) * 1000.0
+
+    x_hat_np = x_hat.cpu().numpy()[:, 0, :, :]
+    recon_paths, orig_paths = _postprocess_per_marker(
+        x_hat_np=x_hat_np,
+        markers=meta["markers"],
+        oas_path=oas_path,
+        config=config,
+        recon_dir=recon_dir,
+        orig_dir=orig_dir,
+        rf_erosion=rf_erosion,
+        dbu_um=dbu_um,
+        stem=cdna_path.stem,
+        inspect_dir=inspect_dir,
+    )
     log.debug("Decode: %s  N=%d  %.1f ms", cdna_path.name, len(meta["markers"]), decode_ms)
     return recon_paths, orig_paths, decode_ms
+
+
+def encode_decode_inmem(
+    row: dict[str, Any],
+    expanded_markers: list[dict[str, Any]],
+    patches_np: np.ndarray,
+    oas_path: Path,
+    model: CurveCodec,
+    device: torch.device,
+    config: dict[str, Any],
+    recon_dir: Path,
+    orig_dir: Path,
+    rf_erosion: int,
+    dbu_um: float,
+    inspect_dir: Path | None = None,
+) -> tuple[list[Path], list[Path], float, float]:
+    """No-quant eval path: encoder → decoder in memory, no ``.cdna`` roundtrip.
+
+    Used when ``model.quantize=False`` to measure pure AE reconstruction
+    quality without the destructive quantize-at-scale-1 step.  Encode and
+    decode are run in a single ``model(x)`` forward pass; wall-clock is
+    split 50/50 between the reported encode/decode times for parity with
+    the quantized path.
+
+    Returns:
+        ``(recon_paths, orig_paths, encode_ms, decode_ms)``.
+    """
+    stem = Path(row["file"]).stem
+    x = torch.from_numpy(patches_np[:, None, :, :]).to(device)
+
+    t0 = time.perf_counter()
+    with torch.no_grad():
+        x_hat = model(x)  # encoder → (bypassed quantizer) → decoder
+    elapsed_ms = (time.perf_counter() - t0) * 1000.0
+
+    x_hat_np = x_hat.cpu().numpy()[:, 0, :, :]
+    recon_paths, orig_paths = _postprocess_per_marker(
+        x_hat_np=x_hat_np,
+        markers=expanded_markers,
+        oas_path=oas_path,
+        config=config,
+        recon_dir=recon_dir,
+        orig_dir=orig_dir,
+        rf_erosion=rf_erosion,
+        dbu_um=dbu_um,
+        stem=stem,
+        inspect_dir=inspect_dir,
+    )
+    half = elapsed_ms / 2.0
+    log.debug("In-mem codec: %s  N=%d  %.1f ms", stem, len(expanded_markers), elapsed_ms)
+    return recon_paths, orig_paths, half, half
 
 
 # ─── Metrics pass ────────────────────────────────────────────────────────────
@@ -575,7 +645,7 @@ def compute_metrics(
     row: dict[str, Any],
     orig_markers: list[dict[str, Any]],
     oas_path: Path,
-    cdna_path: Path,
+    cdna_path: Path | None,
     recon_paths: list[Path],
     orig_paths: list[Path],
     encode_ms: float,
@@ -598,7 +668,7 @@ def compute_metrics(
     Returns:
         List of result dicts, one per marker.
     """
-    cr = compression_ratio(oas_path, cdna_path)
+    cr = compression_ratio(oas_path, cdna_path) if cdna_path is not None else float("nan")
     n = len(orig_markers)
     enc_per = encode_ms / max(n, 1)
     dec_per = decode_ms / max(n, 1)
@@ -618,7 +688,7 @@ def compute_metrics(
             "marker_idx":            i,
             "marker_x_nm":           float(marker["x_nm"]),
             "marker_y_nm":           float(marker["y_nm"]),
-            "compression_ratio":     round(cr, 4),
+            "compression_ratio":     round(cr, 4) if not np.isnan(cr) else None,
             "area_difference_ratio": round(adr, 6) if not np.isnan(adr) else None,
             "encode_ms":             round(enc_per, 2),
             "decode_ms":             round(dec_per, 2),
@@ -680,6 +750,11 @@ def evaluate(
         ckpt.get("epoch", -1),
         ckpt.get("best_val_loss", float("nan")),
     )
+    if not getattr(model, "quantize", True):
+        log.info(
+            "model.quantize=False — bypassing .cdna roundtrip; "
+            "running encoder→decoder in memory.  CR is reported as N/A."
+        )
 
     # ── Read manifest for marker_margin_nm ───────────────────────────────────
     cache_dir = _PROJECT_ROOT / config["dataset"]["cache_dir"]
@@ -738,39 +813,60 @@ def evaluate(
 
         log.debug("  markers=%d  S_exp=%d", len(orig_markers), patches_np.shape[1])
 
-        # ── Step 2: Encode → .cdna ────────────────────────────────────────────
-        try:
-            cdna_path, encode_ms = encode_file(
-                row=row,
-                expanded_markers=expanded_markers,
-                patches_np=patches_np,
-                model=model,
-                device=device,
-                config=config,
-                dna_dir=dna_dir,
-                checkpoint_path=checkpoint_path,
-            )
-        except Exception as exc:
-            log.error("Encode failed for %s: %s", row["file"], exc)
-            continue
+        cdna_path: Path | None = None
+        if getattr(model, "quantize", True):
+            # ── Quantized path: encode → .cdna → load → dequantize → decode ──
+            try:
+                cdna_path, encode_ms = encode_file(
+                    row=row,
+                    expanded_markers=expanded_markers,
+                    patches_np=patches_np,
+                    model=model,
+                    device=device,
+                    config=config,
+                    dna_dir=dna_dir,
+                    checkpoint_path=checkpoint_path,
+                )
+            except Exception as exc:
+                log.error("Encode failed for %s: %s", row["file"], exc)
+                continue
 
-        # ── Step 3: Load .cdna → decode → crop → contour ─────────────────────
-        try:
-            recon_paths, orig_paths, decode_ms = decode_file(
-                cdna_path=cdna_path,
-                oas_path=oas_path,
-                model=model,
-                device=device,
-                config=config,
-                recon_dir=recon_dir,
-                orig_dir=orig_dir,
-                rf_erosion=rf_erosion,
-                dbu_um=dbu_um,
-                inspect_dir=inspect_dir,
-            )
-        except Exception as exc:
-            log.error("Decode failed for %s: %s", row["file"], exc)
-            continue
+            try:
+                recon_paths, orig_paths, decode_ms = decode_file(
+                    cdna_path=cdna_path,
+                    oas_path=oas_path,
+                    model=model,
+                    device=device,
+                    config=config,
+                    recon_dir=recon_dir,
+                    orig_dir=orig_dir,
+                    rf_erosion=rf_erosion,
+                    dbu_um=dbu_um,
+                    inspect_dir=inspect_dir,
+                )
+            except Exception as exc:
+                log.error("Decode failed for %s: %s", row["file"], exc)
+                continue
+        else:
+            # ── No-quant path: encoder → decoder in memory (no .cdna roundtrip)
+            try:
+                recon_paths, orig_paths, encode_ms, decode_ms = encode_decode_inmem(
+                    row=row,
+                    expanded_markers=expanded_markers,
+                    patches_np=patches_np,
+                    oas_path=oas_path,
+                    model=model,
+                    device=device,
+                    config=config,
+                    recon_dir=recon_dir,
+                    orig_dir=orig_dir,
+                    rf_erosion=rf_erosion,
+                    dbu_um=dbu_um,
+                    inspect_dir=inspect_dir,
+                )
+            except Exception as exc:
+                log.error("In-memory codec failed for %s: %s", row["file"], exc)
+                continue
 
         if not recon_paths:
             log.warning("No valid decoded markers for %s — skipping metrics", row["file"])

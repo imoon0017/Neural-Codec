@@ -32,12 +32,17 @@ class CurveCodec(nn.Module):
             raise ValueError(f"model.quantizer_bits must be 8 or 16, got {bits}")
 
         D: int = int(config["model"]["latent_dim"])
+        self.quantize: bool = bool(config["model"].get("quantize", True))
         self.encoder = Encoder(config)
         self.quantizer = QuantizerLayer(latent_dim=D, bits=bits)
         self.decoder = Decoder(config)
 
     def forward(self, x: Tensor) -> Tensor:
         """Encode, quantize-dequantize, and decode.
+
+        When ``model.quantize`` is ``False`` the quantizer is bypassed and the
+        decoder receives the raw continuous latent — used to measure the
+        reconstruction cost attributable to quantization alone.
 
         Args:
             x: cSDF patches ``[B, 1, S, S]`` in ``float32``.
@@ -46,7 +51,7 @@ class CurveCodec(nn.Module):
             Reconstructed cSDF patches ``[B, 1, S, S]`` in ``[0, 1]``.
         """
         z = self.encoder(x)
-        z_q = self.quantizer(z)
+        z_q = self.quantizer(z) if self.quantize else z
         return self.decoder(z_q)
 
     def encode(self, x: Tensor) -> Tensor:
