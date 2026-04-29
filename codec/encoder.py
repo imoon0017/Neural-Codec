@@ -66,6 +66,8 @@ class Encoder(nn.Module):
         if 2 ** n_stages != c:
             raise ValueError(f"compaction_ratio must be a power of 2, got {c}")
 
+        self._c: int = c
+
         layers: list[nn.Module] = [
             # Stem
             nn.Conv2d(1, C, 3, padding=1, bias=False),
@@ -86,4 +88,11 @@ class Encoder(nn.Module):
         Returns:
             Continuous latent map ``[B, D, S/c, S/c]`` in ``float32``.
         """
+        h, w = x.shape[-2], x.shape[-1]
+        if h % self._c != 0 or w % self._c != 0:
+            raise ValueError(
+                f"Input spatial size ({h}×{w}) is not divisible by "
+                f"compaction_ratio={self._c}. "
+                f"Re-rasterize the dataset so patch_size_px is a multiple of {self._c}."
+            )
         return self.net(x)
