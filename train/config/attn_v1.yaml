@@ -1,0 +1,56 @@
+model:
+  arch: curve_codec_attn   # EncoderAttn (conv + windowed MHSA) + Quantizer + Decoder
+  latent_dim: 32           # D — latent feature channels
+  compaction_ratio: 8      # c — power of 2; spatial downsampling factor (must divide S)
+  quantizer_bits: 16       # B — 16-bit uniform per-channel quantization
+  encoder_channels: 64     # C — hidden width for encoder/decoder conv layers
+  attn_heads: 4            # number of MHSA heads at the bottleneck
+  attn_window_size: 7      # spatial window side-length w (105 = 15×7, no padding needed)
+
+csdf:
+  grid_res_nm_per_px: 6.0  # primary rasterization parameter (nm/px)
+  marker_layer: 100         # GDS layer of square marker shapes
+  mask_layer: 1            # GDS layer of mask polygons
+  truncation_px: 5.0       # cSDF band half-width t
+  marker_margin_nm: 100    # expand each marker by this many nm on every side during rasterization
+  # patch_size_px is DERIVED: ceil(marker_size_nm / grid_res_nm_per_px), rounded to multiple of c
+
+dataset:
+  mode: cached             # "cached" or "on_the_fly"
+  cache_dir: dataset/cache/
+
+training:
+  batch_size: 1   # reduced from 4 — attention O(n²) adds memory at S/c=105×105
+  epochs: 200
+  val_every_n_epochs: 1
+
+  # Optimizer
+  optimizer: adamw         # adam | adamw | sgd
+  lr: 1.0e-4
+  weight_decay: 1.0e-2     # L2 regularisation (adamw / sgd)
+
+  # LR schedule
+  lr_scheduler: cosine     # cosine | step | none
+  lr_min: 1.0e-6           # cosine annealing floor
+  warmup_epochs: 5         # linear warmup before cosine decay
+  lr_step_size: 50         # epoch interval for step scheduler (step only)
+  lr_step_gamma: 0.5       # multiplicative factor for step scheduler (step only)
+
+  # Gradient clipping (0 = disabled)
+  grad_clip: 1.0
+
+  # DataLoader workers (keep ≤ CPU count / 2 to avoid pin-memory contention)
+  num_workers: 2
+
+  # Loss
+  loss:
+    recon: mse             # reconstruction term: mse | l1 | huber
+    huber_delta: 1.0       # delta for huber loss (ignored for mse / l1)
+    erosion_margin_px: 16  # exclude this many pixels from every edge in loss
+                           # should cover the encoder receptive-field radius
+                           # (≈15 px for c=8 with 3 stride-2 conv stages)
+
+paths:
+  dataset_root: dataset/raw/
+  checkpoint_dir: checkpoints/
+  run_id: attn_v1
