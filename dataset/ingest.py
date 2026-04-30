@@ -46,7 +46,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import klayout.db as db
 
-from csdf.csdf_utils import PwclContour, PwclSegment, SegmentType, derive_patch_size_px
+from csdf.csdf_utils import PwclContour, PwclSegment, SegmentType
 
 log = logging.getLogger(__name__)
 
@@ -59,7 +59,7 @@ _GDS_EXTS: frozenset[str] = frozenset({".gds", ".gds2", ".gdsii", ".gdx"})
 
 _CATALOG_COLUMNS: list[str] = [
     "file", "split",
-    "marker_size_nm", "patch_size_px",
+    "marker_size_nm",
     "n_polygons", "n_vertices", "has_curves",
 ]
 
@@ -198,7 +198,6 @@ def _extract_file_info(
         )
 
     marker_size_nm: float = all_marker_sizes[0]
-    patch_size_px: int = derive_patch_size_px(marker_size_nm, grid_res_nm_per_px, compaction_ratio)
 
     # ── Count polygons and vertices (step 3) ──────────────────────────────────
     n_polygons = 0
@@ -244,7 +243,6 @@ def _extract_file_info(
         "file": dest_rel,
         "split": split,
         "marker_size_nm": round(marker_size_nm, 4),
-        "patch_size_px": patch_size_px,
         "n_polygons": n_polygons,
         "n_vertices": n_vertices,
         "has_curves": has_curves,
@@ -273,7 +271,6 @@ def write_manifest(
     compaction_ratio = int(config["model"]["compaction_ratio"])
 
     marker_size_nm = float(rows[0]["marker_size_nm"]) if rows else 0.0
-    patch_size_px = derive_patch_size_px(marker_size_nm, grid_res, compaction_ratio) if rows else 0
 
     csdf_source = _PROJECT_ROOT / "csdf" / "csdf_utils.py"
     csdf_hash = hashlib.sha256(csdf_source.read_bytes()).hexdigest()[:12]
@@ -285,7 +282,6 @@ def write_manifest(
     manifest = {
         "grid_res_nm_per_px": grid_res,
         "marker_size_nm": marker_size_nm,
-        "patch_size_px": patch_size_px,
         "truncation_px": truncation_px,
         "marker_margin_nm": marker_margin_nm,
         "n_polygons": total_polygons,
@@ -464,13 +460,11 @@ def ingest(
         raise
 
     # ── Summary ───────────────────────────────────────────────────────────────
-    patch_size_px = new_rows[0]["patch_size_px"]
     total_new_polygons = sum(int(r["n_polygons"]) for r in new_rows)
     total_new_vertices = sum(int(r["n_vertices"]) for r in new_rows)
     n_npy = len(list((cache_dir / split).glob("*.npy")))
 
     print(f"\nMarker size   : {new_marker_size_nm:.1f} nm (unified ✓)")
-    print(f"Patch size    : {patch_size_px} px")
     print(f"Added         : {len(new_files)} file(s) → raw/{split}/")
     print(f"Polygons      : {total_new_polygons} ({total_new_vertices} vertices)")
     skipped = len(source_files) - len(new_files)

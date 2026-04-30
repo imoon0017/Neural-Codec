@@ -34,6 +34,8 @@ from torch.utils.data import Dataset
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from csdf.csdf_utils import derive_patch_size_px
+
 log = logging.getLogger(__name__)
 
 _DATASET_DIR: Path = Path(__file__).resolve().parent
@@ -90,6 +92,12 @@ class CsdfDataset(Dataset):
         self._rows = [r for r in all_rows if r["split"] == split]
         if not self._rows:
             log.warning("No catalog entries for split '%s'", split)
+
+        marker_size_nm = float(self._rows[0]["marker_size_nm"]) if self._rows else 0.0
+        compaction_ratio = int(config["model"]["compaction_ratio"])
+        self._patch_size_px: int = derive_patch_size_px(
+            marker_size_nm, self._grid_res, compaction_ratio
+        )
 
         # Verify manifest in cached mode
         if self._mode == "cached":
@@ -229,7 +237,7 @@ class CsdfDataset(Dataset):
 
         x0_nm = float(meta["canvas_x0_nm"])
         y0_nm = float(meta["canvas_y0_nm"])
-        S = int(row["patch_size_px"])
+        S = self._patch_size_px
 
         col0 = round((marker["x_nm"] - x0_nm) / self._grid_res)
         row0 = round((marker["y_nm"] - y0_nm) / self._grid_res)
@@ -319,7 +327,7 @@ class CsdfDataset(Dataset):
             contours=contours,
             origin_x_nm=marker["x_nm"],
             origin_y_nm=marker["y_nm"],
-            patch_size_px=int(row["patch_size_px"]),
+            patch_size_px=self._patch_size_px,
             grid_res_nm_per_px=self._grid_res,
             truncation_px=self._truncation_px,
         )
