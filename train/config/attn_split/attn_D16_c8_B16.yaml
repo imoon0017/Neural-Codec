@@ -1,6 +1,6 @@
 model:
   arch: curve_codec_attn
-  latent_dim: 32
+  latent_dim: 16
   compaction_ratio: 8
   quantizer_bits: 16
   encoder_channels: 64
@@ -34,4 +34,4 @@ training:
 paths:
   dataset_root: dataset/raw/
   checkpoint_dir: checkpoints/
-  run_id: attn_v1
+  run_id: attn_D16_c8_B16

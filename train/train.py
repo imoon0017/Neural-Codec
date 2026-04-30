@@ -279,6 +279,29 @@ def train(cfg: dict[str, Any], device: torch.device, resume: bool = False) -> No
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     log.info("%s: %d trainable parameters", arch, n_params)
 
+    # ── Derive training.loss.erosion_margin_px from compaction_ratio ─────────
+    # RF of the encoder: stem(3×3,s1) + n×DownBlock(3×3,s2)
+    #   rf = 3; for each stage: rf = (rf-1)*2 + 3
+    # erosion = rf // 2  (half the receptive field radius)
+    import math as _math
+    _c = int(cfg["model"]["compaction_ratio"])
+    _n = round(_math.log2(_c))
+    _rf = 3
+    for _ in range(_n):
+        _rf = (_rf - 1) * 2 + 3
+    cfg.setdefault("training", {}).setdefault("loss", {})["erosion_margin_px"] = _rf // 2
+    log.info("Derived erosion_margin_px=%d (RF=%dpx, c=%d)", _rf // 2, _rf, _c)
+
+    # ── Read marker_margin_nm from cache manifest ──────────────────────────────
+    import yaml as _yaml
+    _cache_dir = _PROJECT_ROOT / cfg["dataset"]["cache_dir"]
+    _manifest_path = _cache_dir / "manifest.yaml"
+    if _manifest_path.exists():
+        with open(_manifest_path) as _f:
+            _manifest = _yaml.safe_load(_f)
+        cfg["csdf"]["marker_margin_nm"] = float(_manifest.get("marker_margin_nm", 0.0))
+        log.info("marker_margin_nm=%g read from cache manifest", cfg["csdf"]["marker_margin_nm"])
+
     # ── Loss ──────────────────────────────────────────────────────────────────
     criterion = ReconLoss(cfg)
     log.info("Loss: %s", criterion)

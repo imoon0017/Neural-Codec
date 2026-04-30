@@ -11,6 +11,7 @@ csdf:
   marker_layer: 100
   mask_layer: 1
   truncation_px: 5.0
+  marker_margin_nm: 188
 dataset:
   mode: cached
   cache_dir: dataset/cache/
@@ -31,7 +32,8 @@ training:
   loss:
     recon: mse
     huber_delta: 1.0
+    erosion_margin_px: 16
 paths:
   dataset_root: dataset/raw/
   checkpoint_dir: checkpoints/
-  run_id: attn_v1
+  run_id: rasterize

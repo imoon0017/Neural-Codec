@@ -136,7 +136,6 @@ class CsdfDataset(Dataset):
         checks = [
             ("grid_res_nm_per_px", float(config["csdf"]["grid_res_nm_per_px"])),
             ("truncation_px",      float(config["csdf"]["truncation_px"])),
-            ("marker_margin_nm",   float(config["csdf"].get("marker_margin_nm", 0.0))),
         ]
         mismatches: list[str] = []
         for key, expected in checks:
