@@ -8,7 +8,7 @@ Architecture (fully convolutional, shift-invariant):
 
     Conv(D → C, 1×1)                                   — channel expansion
     [Conv(C → 4C, 3×3) + PixelShuffle(2) + GN + GELU] × N  — N up-blocks
-    Conv(C → 1, 3×3) + Sigmoid                         — output head
+    Conv(C → 1, 3×3) + Sigmoid                          — output head
 
 Pixel-shuffle upsampling avoids checkerboard artefacts and is
 shift-invariant (spec §Shift-Invariance).
