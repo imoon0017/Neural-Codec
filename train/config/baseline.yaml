@@ -1,8 +1,11 @@
 model:
+  arch: curve_codec_attn
   latent_dim: 32           # D — latent feature channels
   compaction_ratio: 8      # c — power of 2; spatial downsampling factor (must divide S)
   quantizer_bits: 16       # B — 8 → int8 (4× smaller), 16 → int16 (2× smaller)
   encoder_channels: 64     # C — hidden width for encoder/decoder conv layers
+  attn_heads: 4
+  attn_window_size: 7
 
 csdf:
   grid_res_nm_per_px: 6.0  # primary rasterization parameter (nm/px)

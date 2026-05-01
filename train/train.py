@@ -271,7 +271,7 @@ def train(cfg: dict[str, Any], device: torch.device, resume: bool = False) -> No
         del _warmup
 
     # ── Model ─────────────────────────────────────────────────────────────────
-    arch = cfg.get("model", {}).get("arch", "curve_codec")
+    arch = cfg.get("model", {}).get("arch", "curve_codec_attn")
     _ARCH_MAP = {"curve_codec": CurveCodec, "curve_codec_v2": CurveCodecV2, "curve_codec_attn": CurveCodecAttn}
     if arch not in _ARCH_MAP:
         raise ValueError(f"model.arch must be one of {list(_ARCH_MAP)}, got '{arch}'")

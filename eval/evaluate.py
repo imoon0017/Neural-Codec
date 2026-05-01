@@ -739,7 +739,7 @@ def evaluate(
     # ── Load model ────────────────────────────────────────────────────────────
     ckpt = torch.load(checkpoint_path, map_location=device)
     ckpt_cfg: dict[str, Any] = ckpt.get("config", config)
-    arch = ckpt_cfg.get("model", {}).get("arch", "curve_codec")
+    arch = ckpt_cfg.get("model", {}).get("arch", "curve_codec_attn")
     _ARCH_MAP = {"curve_codec": CurveCodec, "curve_codec_v2": CurveCodecV2, "curve_codec_attn": CurveCodecAttn}
     if arch not in _ARCH_MAP:
         raise ValueError(f"model.arch must be one of {list(_ARCH_MAP)}, got '{arch}'")
