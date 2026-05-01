@@ -5,7 +5,8 @@ model:
   quantizer_bits: 16       # B — 8 → int8 (4× smaller), 16 → int16 (2× smaller)
   encoder_channels: 64     # C — hidden width for encoder/decoder conv layers
   attn_heads: 4
-  attn_window_size: 7
+  attn_window_size: 3
+  attn_type: sliding
 
 csdf:
   grid_res_nm_per_px: 6.0  # primary rasterization parameter (nm/px)
