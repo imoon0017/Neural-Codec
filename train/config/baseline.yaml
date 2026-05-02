@@ -1,11 +1,11 @@
 model:
   arch: curve_codec_multiattn
-  latent_dim: 32           # D — latent feature channels
-  compaction_ratio: 8      # c — power of 2; spatial downsampling factor (must divide S)
-  quantizer_bits: 16       # B — 8 → int8 (4× smaller), 16 → int16 (2× smaller)
+  latent_dim: 8            # D — latent feature channels
+  compaction_ratio: 16     # c — power of 2; spatial downsampling factor (must divide S)
+  quantizer_bits: 8        # B — 8 → int8 (4× smaller), 16 → int16 (2× smaller)
   encoder_channels: 64     # C — hidden width for encoder/decoder conv layers
   attn_heads: 4
-  attn_window_sizes: [7, 5, 3, 3]   # one per attention block: stem, mid×(N-1), bottleneck
+  attn_window_sizes: [7, 5, 3, 3, 3]   # N=4 stages → 5 blocks: stem, mid×3, bottleneck
 
 csdf:
   grid_res_nm_per_px: 6.0  # primary rasterization parameter (nm/px)
@@ -20,7 +20,7 @@ dataset:
   cache_dir: dataset/cache/
 
 training:
-  batch_size: 4   # 840×840 px patches; stem activations ~180 MB/sample on GPU
+  batch_size: 1   # 840×840 px patches at c=16; adjust upward if GPU memory allows
   epochs: 200
   val_every_n_epochs: 1
 
@@ -53,4 +53,4 @@ training:
 paths:
   dataset_root: dataset/raw/
   checkpoint_dir: checkpoints/
-  run_id: baseline_v1
+  run_id: baseline_multiattn_v1
