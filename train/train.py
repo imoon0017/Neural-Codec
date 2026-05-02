@@ -37,6 +37,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from codec.loss import ReconLoss
 from codec.model import CurveCodec
 from codec.model_attn import CurveCodecAttn
+from codec.model_multiattn import CurveCodecMultiAttn
 from codec.model_v2 import CurveCodecV2
 from dataset.dataset import make_dataloaders
 
@@ -272,7 +273,7 @@ def train(cfg: dict[str, Any], device: torch.device, resume: bool = False) -> No
 
     # ── Model ─────────────────────────────────────────────────────────────────
     arch = cfg.get("model", {}).get("arch", "curve_codec_attn")
-    _ARCH_MAP = {"curve_codec": CurveCodec, "curve_codec_v2": CurveCodecV2, "curve_codec_attn": CurveCodecAttn}
+    _ARCH_MAP = {"curve_codec": CurveCodec, "curve_codec_v2": CurveCodecV2, "curve_codec_attn": CurveCodecAttn, "curve_codec_multiattn": CurveCodecMultiAttn}
     if arch not in _ARCH_MAP:
         raise ValueError(f"model.arch must be one of {list(_ARCH_MAP)}, got '{arch}'")
     model = _ARCH_MAP[arch](cfg).to(device)
