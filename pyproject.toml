@@ -23,7 +23,7 @@ dev = [
 ]
 
 [tool.setuptools.packages.find]
-include = ["csdf*", "codec*", "contouring*", "io*", "dataset*", "eval*", "train*", "scripts*"]
+include = ["csdf*", "codec*", "contouring*", "correction*", "io*", "dataset*", "eval*", "train*", "scripts*"]
 
 [tool.black]
 line-length = 100

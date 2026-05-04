@@ -21,6 +21,7 @@ htmlcov/
 # Scratch / temporary outputs
 tmp/
 scripts/tmp/
+model_graph_tmp.py
 
 # Model checkpoints (large binaries — external storage)
 checkpoints/
