@@ -75,6 +75,16 @@ def csdf_to_contours(
     if not (0.0 < iso < 1.0):
         raise ValueError(f"iso must be in (0, 1), got {iso}")
 
+    # Pad with a 1-pixel ring of zeros outside the patch so that polygons
+    # extending to the crop boundary produce closed contours rather than open
+    # edge-tracing artefacts.  The origin is shifted by one pixel to keep all
+    # contour coordinates in the correct physical space.  Unlike zeroing the
+    # outermost data ring, this preserves the full cSDF and closes contours
+    # exactly at the patch edge rather than one pixel inward.
+    csdf = np.pad(csdf, pad_width=1, mode="constant", constant_values=0.0)
+    origin_x_nm = origin_x_nm - grid_res_nm_per_px
+    origin_y_nm = origin_y_nm - grid_res_nm_per_px
+
     # Step 1: extract pixel-space iso-contours
     raw_contours = extract_isocontours(csdf, iso=iso)
     if not raw_contours:

@@ -302,9 +302,13 @@ def test_csdf_to_contours_empty_patch():
 
 
 def test_csdf_to_contours_full_patch():
+    # A fully-interior patch represents a polygon covering the entire patch.
+    # The zero-padding in csdf_to_contours closes the contour at the patch
+    # boundary, so exactly one outer (non-hole) contour should be returned.
     csdf = np.ones((32, 32), dtype=np.float32)
     contours = csdf_to_contours(csdf, 0.0, 0.0, 1.0)
-    assert contours == []
+    assert len(contours) == 1
+    assert contours[0].is_hole is False
 
 
 def test_csdf_to_contours_invalid_ndim():
