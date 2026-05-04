@@ -438,6 +438,60 @@ def _write_inspection_oas(
 # ─── Decode + crop pass ──────────────────────────────────────────────────────
 
 
+def _clip_hulls_to_crop(
+    hulls: list[list[tuple[float, float]]],
+    crop_x0_nm: float,
+    crop_y0_nm: float,
+    crop_size_nm: float,
+    dbu_um: float,
+) -> list[list[tuple[float, float]]]:
+    """Geometrically clip polygon hulls to the crop bounding box.
+
+    Uses ``klayout.db.Region`` boolean AND so the result is exact regardless
+    of whether a polygon's centroid lies inside or outside the box.
+
+    Args:
+        hulls: Polygon hulls in nm.
+        crop_x0_nm: Left/bottom origin of the crop box (nm).
+        crop_y0_nm: Left/bottom origin of the crop box (nm).
+        crop_size_nm: Side length of the (square) crop box (nm).
+        dbu_um: Layout DBU in µm (nm → DBU conversion factor).
+
+    Returns:
+        Clipped hull list; polygons fully outside the box are dropped,
+        polygons partially outside are trimmed to the box boundary.
+    """
+    import klayout.db as db
+
+    if not hulls:
+        return hulls
+
+    scale  = 1.0 / (dbu_um * 1000.0)   # nm → DBU
+    dbu_nm = dbu_um * 1000.0            # DBU → nm
+
+    crop_region = db.Region(db.Box(
+        round(crop_x0_nm * scale),
+        round(crop_y0_nm * scale),
+        round((crop_x0_nm + crop_size_nm) * scale),
+        round((crop_y0_nm + crop_size_nm) * scale),
+    ))
+
+    hull_region = db.Region()
+    for hull in hulls:
+        pts = [db.Point(round(x * scale), round(y * scale)) for x, y in hull]
+        if len(pts) >= 3:
+            hull_region.insert(db.Polygon(pts))
+
+    clipped = hull_region & crop_region
+
+    result: list[list[tuple[float, float]]] = []
+    for poly in clipped.each():
+        pts_nm = [(pt.x * dbu_nm, pt.y * dbu_nm) for pt in poly.each_point_hull()]
+        if pts_nm:
+            result.append(pts_nm)
+    return result
+
+
 def _postprocess_per_marker(
     x_hat_np: np.ndarray,
     markers: list[dict[str, Any]],
@@ -517,6 +571,15 @@ def _postprocess_per_marker(
             if pts:
                 recon_hulls.append(pts)
 
+        # Clip both reconstructed and original polygons to the crop box so the
+        # ADR comparison is bounded by the same region on both sides.
+        # read_polygons_in_region uses centroid-in-box (no geometric clip), so
+        # polygons whose bodies extend beyond the crop boundary are returned in
+        # full; without an explicit clip they would inflate the XOR area.
+        recon_hulls = _clip_hulls_to_crop(
+            recon_hulls, crop_x0_nm, crop_y0_nm, crop_size_nm, dbu_um
+        )
+
         recon_path = recon_dir / f"{stem}_m{i:04d}.oas"
         write_oas(recon_path, recon_hulls, mask_layer=mask_layer, dbu=dbu_um)
         recon_paths.append(recon_path)
@@ -529,6 +592,9 @@ def _postprocess_per_marker(
             y0_nm=crop_y0_nm,
             x1_nm=crop_x0_nm + crop_size_nm,
             y1_nm=crop_y0_nm + crop_size_nm,
+        )
+        orig_hulls = _clip_hulls_to_crop(
+            orig_hulls, crop_x0_nm, crop_y0_nm, crop_size_nm, dbu_um
         )
         orig_path = orig_dir / f"{stem}_m{i:04d}.oas"
         write_oas(orig_path, orig_hulls, mask_layer=mask_layer, dbu=dbu_um)
