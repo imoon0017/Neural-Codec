@@ -276,6 +276,15 @@ def _rasterize_file_expanded(
         truncation_px=truncation_px,
     )
 
+    # Pad zeros around the canvas so that polygons reaching the canvas edge
+    # see explicit exterior (0) rather than an abrupt data boundary.
+    # canvas_x0_nm / canvas_y0_nm are updated so per-marker col0/row0
+    # indices remain correct after the origin shift.
+    _CANVAS_PAD = max(1, round(truncation_px))
+    canvas = np.pad(canvas, pad_width=_CANVAS_PAD, mode="constant", constant_values=0.0)
+    canvas_x0_nm -= _CANVAS_PAD * grid_res
+    canvas_y0_nm -= _CANVAS_PAD * grid_res
+
     # ── Crop per-marker patches from canvas, then zero-pad to s_exp ──────────
     # Zero-padding is applied at the right and top (high indices).  Because
     # s_exp - s_nat <= c-1 < c = rf_erosion, the padded pixels are always
@@ -551,17 +560,20 @@ def _postprocess_per_marker(
             )
             continue
 
-        # Crop reconstructed cSDF to the cropping marker
+        # Run marching squares on the FULL expanded patch (not the rf-eroded
+        # crop).  The margin pixels provide accurate SDF context for polygons
+        # near the crop boundary, so the traced contour follows the real
+        # polygon edge.  _clip_hulls_to_crop below then cuts the contour to
+        # the crop box, producing the same straight edge as read_polygons_in_
+        # region — eliminating the slit XOR that appeared when marching squares
+        # ran on the cropped cSDF and closed the contour slightly inside the
+        # crop boundary.
         csdf_full = x_hat_np[i]  # [S_exp, S_exp]
-        rf = rf_erosion
-        csdf_crop = csdf_full[rf: csdf_full.shape[0] - rf,
-                               rf: csdf_full.shape[1] - rf]
 
-        # Contour in physical nm using the cropping-marker origin
         contours = csdf_to_contours(
-            csdf=csdf_crop.astype(np.float32),
-            origin_x_nm=crop_x0_nm,
-            origin_y_nm=crop_y0_nm,
+            csdf=csdf_full.astype(np.float32),
+            origin_x_nm=exp_x_nm,
+            origin_y_nm=exp_y_nm,
             grid_res_nm_per_px=grid_res,
         )
 
