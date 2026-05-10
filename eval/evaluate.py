@@ -1,24 +1,21 @@
-"""Evaluation script for a trained CurveCodec checkpoint.
+"""Neural codec evaluation suite — unified entry point.
 
-Runs the full codec pipeline on a dataset split (default: **test**) in strict
-sequence:
+Mode is selected by optional flags; the default path is the full codec eval.
 
-1. **Read** — load raw OASIS; extract square markers from the marker layer.
-2. **Expand** — enlarge each marker by ``marker_margin_nm`` (read from
-   ``dataset/cache/manifest.yaml``) on all four sides so the cSDF is not
-   artificially truncated at the boundary.
-3. **Rasterize** — build a shared canvas for all expanded markers and crop
-   per-marker patches ``[N, S_exp, S_exp]`` (S_exp rounded up to a multiple of
-   the compaction ratio *c*).
-4. **Codec** — encode → quantize → save ``.cdna`` → load ``.cdna`` →
-   dequantize → decode → contour.
-5. **Crop** — before ADR the reconstructed cSDF and the original polygons are
-   both cropped to the *cropping marker*: the expanded marker shrunk by
-   ``rf_erosion_px × grid_res_nm_per_px`` on every side, where
-   ``rf_erosion_px = c`` (encoder RF radius from the architecture
-   ``RF = 2c + 1``).
-6. **Metrics** — area difference ratio on the cropped masks; write
-   ``<output-dir>/results.csv`` and ``<output-dir>/summary.json``.
+Flags
+-----
+(none / --checkpoint only)
+    Full encode → quantize → decode → ADR pipeline.
+--bypass
+    Rasterize → marching-squares only; no codec, no checkpoint required.
+    Measures the theoretical ADR floor introduced by discretisation alone.
+--correction-factor FLOAT
+    Baseline + iterative field-correction comparison (ADR + field MSE).
+    Requires --checkpoint.
+--segment-distance
+    Segment-centre EPE to nearest original boundary edge (mean, std, p95, …).
+    Runs after the main eval pass, or standalone with --results-dir /
+    --correction-results-dir / --orig-dir + --recon-dir.
 
 Usage::
 
@@ -26,8 +23,21 @@ Usage::
         --checkpoint checkpoints/baseline_v1/best.pt \\
         --config     train/config/baseline.yaml \\
         --output-dir eval/results/baseline_v1/ \\
-        --device     cuda \\
-        --split      test
+        --device cuda --split test [--inspection]
+
+    python eval/evaluate.py --bypass \\
+        --config     train/config/baseline.yaml \\
+        --output-dir eval/results/bypass_reference/
+
+    python eval/evaluate.py \\
+        --checkpoint checkpoints/baseline_v1/best.pt \\
+        --config     train/config/baseline.yaml \\
+        --output-dir eval/results/correction_baseline_v1/ \\
+        --correction-factor 0.5 --n-iterations 5
+
+    python eval/evaluate.py --segment-distance \\
+        --results-dir eval/results/baseline_v1/ \\
+        --mask-layer 1 [--spec 2.0]
 """
 
 from __future__ import annotations
@@ -991,19 +1001,23 @@ def evaluate(
 
 # ─── CLI ─────────────────────────────────────────────────────────────────────
 
+_DEFAULT_CFG = _PROJECT_ROOT / "train" / "config" / "baseline.yaml"
 
-def parse_args() -> argparse.Namespace:
+
+def _make_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+        prog="evaluate.py",
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+
+    # ── Core arguments ─────────────────────────────────────────────────────────
+    p.add_argument(
+        "--checkpoint", type=Path, default=None,
+        help="Path to .pt checkpoint (required for codec/correction eval).",
     )
     p.add_argument(
-        "--checkpoint", type=Path,
-        default=_PROJECT_ROOT / "checkpoints" / "baseline_v1" / "best.pt",
-        help="Path to .pt checkpoint (default: checkpoints/baseline_v1/best.pt)",
-    )
-    p.add_argument(
-        "--config", type=Path,
-        default=_PROJECT_ROOT / "train" / "config" / "baseline.yaml",
+        "--config", type=Path, default=_DEFAULT_CFG,
         help="YAML config file (default: train/config/baseline.yaml)",
     )
     p.add_argument(
@@ -1023,13 +1037,133 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--inspection", action="store_true",
         help=(
-            "Write per-marker 4-layer inspection .oas files to "
-            "<output-dir>/inspection/  "
+            f"Write per-marker 4-layer inspection .oas files to <output-dir>/inspection/  "
             f"(orig=layer {_INSP_ORIG_LAYER}, recon={_INSP_RECON_LAYER}, "
             f"xor={_INSP_XOR_LAYER}, valid-marker={_INSP_MARKER_LAYER})"
         ),
     )
-    return p.parse_args()
+
+    # ── Mode flags ─────────────────────────────────────────────────────────────
+    p.add_argument(
+        "--bypass", action="store_true",
+        help="Rasterize→marching-squares only; no codec, no checkpoint required.",
+    )
+    p.add_argument(
+        "--correction-factor", type=float, default=None,
+        help=(
+            "Enable iterative field-correction with step size α ∈ [0, 1].  "
+            "Runs baseline + corrected passes side-by-side.  Requires --checkpoint."
+        ),
+    )
+    p.add_argument(
+        "--n-iterations", type=int, default=5,
+        help="Number of correction iterations (default: 5; only used with --correction-factor).",
+    )
+
+    # ── Segment-distance arguments ─────────────────────────────────────────────
+    p.add_argument(
+        "--segment-distance", action="store_true",
+        help=(
+            "Run segment-centre EPE evaluation after the main eval pass, "
+            "or standalone when combined with --results-dir / --correction-results-dir."
+        ),
+    )
+    p.add_argument(
+        "--results-dir", type=Path, default=None, metavar="DIR",
+        help=(
+            "Root output dir from a prior codec/bypass run.  "
+            "<DIR>/original/ and <DIR>/reconstructed/ are used automatically.  "
+            "Implies --segment-distance."
+        ),
+    )
+    p.add_argument(
+        "--correction-results-dir", type=Path, default=None, metavar="DIR",
+        help=(
+            "Root output dir from a prior correction run.  "
+            "Runs baseline and corrected passes side-by-side.  "
+            "Implies --segment-distance."
+        ),
+    )
+    p.add_argument(
+        "--orig-dir", type=Path, default=None, metavar="DIR",
+        help="Explicit original .oas directory (use together with --recon-dir).",
+    )
+    p.add_argument(
+        "--recon-dir", type=Path, default=None, metavar="DIR",
+        help="Explicit reconstructed .oas directory (use together with --orig-dir).",
+    )
+    p.add_argument(
+        "--mask-layer", type=int, default=1,
+        help="GDS layer number of mask polygons for segment-distance (default: 1).",
+    )
+    p.add_argument(
+        "--spec", type=float, default=None, metavar="NM",
+        help=(
+            "EPE spec in nm.  Segments exceeding this distance are written as square "
+            "markers (layer 100) to <output>_violations/ alongside the summary JSON."
+        ),
+    )
+    p.add_argument(
+        "--violation-marker-size-nm", type=float, default=2.0, metavar="NM",
+        help="Side length of violation marker squares in nm (default: 2.0).",
+    )
+    p.add_argument(
+        "--segment-distance-output", type=Path, default=None,
+        help=(
+            "Output JSON path for segment-distance summary.  "
+            "Defaults to <output-dir>/segment_distance_summary.json."
+        ),
+    )
+
+    return p
+
+
+def _resolve_device(device_str: str | None) -> torch.device:
+    if device_str is not None:
+        return torch.device(device_str)
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def _run_segdist_correction(
+    root: Path,
+    mask_layer: int,
+    spec_nm: float | None,
+    violation_marker_size: float,
+    evaluate_segment_distance: Any,
+    _print_summary: Any,
+    _print_comparison: Any,
+) -> None:
+    orig_dir       = root / "original"
+    base_recon_dir = root / "baseline"  / "reconstructed"
+    corr_recon_dir = root / "corrected" / "reconstructed"
+    for d, label in (
+        (orig_dir,       "original"),
+        (base_recon_dir, "baseline/reconstructed"),
+        (corr_recon_dir, "corrected/reconstructed"),
+    ):
+        if not d.is_dir():
+            log.error("%s does not exist or is not a directory: %s", label, d)
+            sys.exit(1)
+    base_json = root / "segment_distance_baseline.json"
+    corr_json = root / "segment_distance_corrected.json"
+    log.info("── Baseline segment-distance pass ──")
+    base_summary = evaluate_segment_distance(
+        orig_dir=orig_dir, recon_dir=base_recon_dir,
+        mask_layer=mask_layer, output_json=base_json,
+        spec_nm=spec_nm, violation_marker_size_nm=violation_marker_size,
+    )
+    log.info("── Corrected segment-distance pass ──")
+    corr_summary = evaluate_segment_distance(
+        orig_dir=orig_dir, recon_dir=corr_recon_dir,
+        mask_layer=mask_layer, output_json=corr_json,
+        spec_nm=spec_nm, violation_marker_size_nm=violation_marker_size,
+    )
+    if not base_summary or not corr_summary:
+        log.warning("No segment-distance results produced.")
+        return
+    _print_summary("Baseline reconstruction",  base_summary, base_json)
+    _print_summary("Corrected reconstruction", corr_summary, corr_json)
+    _print_comparison(base_summary, corr_summary)
 
 
 def main() -> None:
@@ -1038,29 +1172,121 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         datefmt="%H:%M:%S",
     )
-    args = parse_args()
+    args = _make_parser().parse_args()
 
-    if not args.checkpoint.exists():
-        log.error("Checkpoint not found: %s", args.checkpoint)
+    run_segdist = (
+        args.segment_distance
+        or args.results_dir is not None
+        or args.correction_results_dir is not None
+        or (args.orig_dir is not None and args.recon_dir is not None)
+    )
+    run_eval = args.checkpoint is not None or args.bypass
+
+    if not run_eval and not run_segdist:
+        log.error(
+            "Nothing to do.  Provide --checkpoint (codec/correction eval), "
+            "--bypass (bypass eval), or a --results-dir / --correction-results-dir "
+            "(standalone segment-distance)."
+        )
         sys.exit(1)
 
-    config = _load_config(args.config)
+    # ── Main eval pass ─────────────────────────────────────────────────────────
+    if run_eval:
+        config = _load_config(args.config)
+        device = _resolve_device(args.device)
+        log.info("Device: %s", device)
 
-    device = (
-        torch.device(args.device)
-        if args.device is not None
-        else torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    )
-    log.info("Device: %s", device)
+        if args.bypass:
+            from eval.evaluate_bypass import evaluate_bypass
+            evaluate_bypass(
+                config=config,
+                output_dir=args.output_dir,
+                split=args.split,
+                inspection=args.inspection,
+            )
+        elif args.correction_factor is not None:
+            if not args.checkpoint.exists():
+                log.error("Checkpoint not found: %s", args.checkpoint)
+                sys.exit(1)
+            from eval.evaluate_correction import evaluate_correction
+            evaluate_correction(
+                checkpoint_path=args.checkpoint,
+                config=config,
+                output_dir=args.output_dir,
+                device=device,
+                correction_factor=args.correction_factor,
+                n_iterations=args.n_iterations,
+                split=args.split,
+            )
+        else:
+            if not args.checkpoint.exists():
+                log.error("Checkpoint not found: %s", args.checkpoint)
+                sys.exit(1)
+            evaluate(
+                checkpoint_path=args.checkpoint,
+                config=config,
+                output_dir=args.output_dir,
+                device=device,
+                split=args.split,
+                inspection=args.inspection,
+            )
 
-    evaluate(
-        checkpoint_path=args.checkpoint,
-        config=config,
-        output_dir=args.output_dir,
-        device=device,
-        split=args.split,
-        inspection=args.inspection,
-    )
+    # ── Segment-distance pass ──────────────────────────────────────────────────
+    if run_segdist:
+        from eval.evaluate_segment_distance import (
+            evaluate_segment_distance,
+            _print_comparison,
+            _print_summary,
+        )
+        mask_layer            = args.mask_layer
+        spec_nm               = args.spec
+        violation_marker_size = args.violation_marker_size_nm
+
+        # Determine effective source dirs, falling back to the eval output when
+        # --segment-distance was combined with a main eval pass.
+        corr_root  = args.correction_results_dir
+        plain_root = args.results_dir
+        sd_orig_dir  = args.orig_dir
+        sd_recon_dir = args.recon_dir
+
+        if args.segment_distance and run_eval and corr_root is None and plain_root is None and sd_orig_dir is None:
+            if args.correction_factor is not None:
+                corr_root = args.output_dir
+            else:
+                plain_root = args.output_dir
+
+        if corr_root is not None:
+            _run_segdist_correction(
+                corr_root, mask_layer, spec_nm, violation_marker_size,
+                evaluate_segment_distance, _print_summary, _print_comparison,
+            )
+        else:
+            if plain_root is not None:
+                sd_orig_dir  = plain_root / "original"
+                sd_recon_dir = plain_root / "reconstructed"
+                default_out  = plain_root / "segment_distance_summary.json"
+            elif sd_orig_dir is not None and sd_recon_dir is not None:
+                default_out = sd_recon_dir.parent / "segment_distance_summary.json"
+            else:
+                log.error(
+                    "Provide --results-dir, --correction-results-dir, "
+                    "or both --orig-dir and --recon-dir for segment-distance."
+                )
+                sys.exit(1)
+            for d, label in ((sd_orig_dir, "orig-dir"), (sd_recon_dir, "recon-dir")):
+                if not d.is_dir():
+                    log.error("%s does not exist or is not a directory: %s", label, d)
+                    sys.exit(1)
+            output_json = args.segment_distance_output or default_out
+            summary = evaluate_segment_distance(
+                orig_dir=sd_orig_dir, recon_dir=sd_recon_dir,
+                mask_layer=mask_layer, output_json=output_json,
+                spec_nm=spec_nm, violation_marker_size_nm=violation_marker_size,
+            )
+            if summary:
+                _print_summary("Segment-centre distance to original boundary", summary, output_json)
+            else:
+                log.warning("No results produced.")
 
 
 if __name__ == "__main__":

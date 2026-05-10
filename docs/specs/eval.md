@@ -51,11 +51,17 @@ def area_difference_ratio(original_oas_path: Path, reconstructed_oas_path: Path)
 |---|---|
 | Compression ratio | ≥ 10× |
 | Area difference ratio | ≤ 0.02 (≤ 2%) |
+| Segment-centre boundary distance, p99 | < 1.0 nm |
 | Encoder inference, GPU | ≤ 50 ms |
 | Encoder inference, CPU | ≤ 500 ms |
 | Decoder + contouring, GPU | ≤ 100 ms |
 | Decoder + contouring, CPU | ≤ 1000 ms |
 | Rasterizer throughput, GPU/CPU | TBD after profiling on target process node |
+
+Segment-centre boundary distance is computed by `eval/evaluate_segment_distance.py`: for every
+segment in the reconstructed PWCL layer, the Euclidean distance from the segment's parametric
+midpoint to the nearest edge on the original polygon boundary is measured in nm.  The p99
+statistic across all segments and all samples must be below 1.0 nm.
 
 Hausdorff distance is tracked during training as a proxy but is **not** an official metric.
 

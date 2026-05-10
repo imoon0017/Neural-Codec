@@ -28,7 +28,6 @@ Usage::
 
 from __future__ import annotations
 
-import argparse
 import json
 import logging
 import sys
@@ -62,14 +61,6 @@ from eval.report import write_results_csv  # noqa: E402
 log = logging.getLogger(__name__)
 
 _DATASET_DIR = _PROJECT_ROOT / "dataset"
-
-
-# ─── Config ──────────────────────────────────────────────────────────────────
-
-
-def _load_config(path: Path) -> dict[str, Any]:
-    with open(path) as f:
-        return yaml.safe_load(f)
 
 
 # ─── Summary ─────────────────────────────────────────────────────────────────
@@ -379,55 +370,3 @@ def evaluate_bypass(
     log.info("Bypass evaluation complete.  Output: %s", output_dir)
 
 
-# ─── CLI ─────────────────────────────────────────────────────────────────────
-
-
-def _parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(
-        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
-    )
-    p.add_argument(
-        "--config", type=Path,
-        default=_PROJECT_ROOT / "train" / "config" / "baseline.yaml",
-        help="YAML config file (default: train/config/baseline.yaml)",
-    )
-    p.add_argument(
-        "--output-dir", type=Path,
-        default=_PROJECT_ROOT / "eval" / "results" / "bypass_reference",
-        help="Root directory for outputs (default: eval/results/bypass_reference/)",
-    )
-    p.add_argument(
-        "--split", type=str, default="test",
-        choices=["train", "validation", "test"],
-        help="Dataset split to evaluate (default: test)",
-    )
-    p.add_argument(
-        "--inspection", action="store_true",
-        help=(
-            "Write per-marker 4-layer inspection .oas files to "
-            "<output-dir>/inspection/  "
-            f"(orig=layer {_INSP_ORIG_LAYER}, recon={_INSP_RECON_LAYER}, "
-            f"xor={_INSP_XOR_LAYER}, valid-marker={_INSP_MARKER_LAYER})"
-        ),
-    )
-    return p.parse_args()
-
-
-def main() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        datefmt="%H:%M:%S",
-    )
-    args = _parse_args()
-    config = _load_config(args.config)
-    evaluate_bypass(
-        config=config,
-        output_dir=args.output_dir,
-        split=args.split,
-        inspection=args.inspection,
-    )
-
-
-if __name__ == "__main__":
-    main()

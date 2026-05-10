@@ -94,7 +94,7 @@ echo "============================================================"
 echo ""
 
 CMD=(
-    python eval/evaluate_bypass.py
+    python eval/evaluate.py --bypass
     --config     "${CFG}"
     --output-dir "${OUT_DIR}"
     --split      "${SPLIT}"

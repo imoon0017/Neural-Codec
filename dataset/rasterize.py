@@ -369,6 +369,10 @@ def parse_args() -> argparse.Namespace:
                    help="Parallel worker processes (default: 1)")
     p.add_argument("--force", action="store_true",
                    help="Overwrite existing .npy files")
+    p.add_argument("--truncation-px", type=float, default=None,
+                   help="Override csdf.truncation_px from config")
+    p.add_argument("--cache-dir", type=Path, default=None,
+                   help="Override dataset.cache_dir from config")
     return p.parse_args()
 
 
@@ -376,6 +380,11 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     args = parse_args()
     config = _load_config(args.config)
+
+    if args.truncation_px is not None:
+        config["csdf"]["truncation_px"] = args.truncation_px
+    if args.cache_dir is not None:
+        config["dataset"]["cache_dir"] = str(args.cache_dir)
 
     generated = rasterize_catalog(
         config=config,

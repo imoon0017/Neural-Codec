@@ -39,7 +39,6 @@ Usage::
 
 from __future__ import annotations
 
-import argparse
 import csv
 import json
 import logging
@@ -58,6 +57,9 @@ sys.path.insert(0, str(_PROJECT_ROOT / "io"))
 from csdf.csdf_utils import PwclContour, PwclSegment, SegmentType
 
 log = logging.getLogger(__name__)
+
+_VIOLATION_LAYER: int = 100  # GDS layer used for EPE-violation marker output
+_DEFAULT_VIOLATION_MARKER_SIZE_NM: float = 2.0  # side length of violation marker squares
 
 # Sampling pitch used when building a cKDTree from original polygon edges.
 # At 0.5 nm the approximation error is ≤ 0.25 nm (well below the 1 nm/px
@@ -272,6 +274,7 @@ def _process_pair(
     orig_path: Path,
     recon_path: Path,
     mask_layer: int,
+    spec_nm: float | None = None,
 ) -> dict[str, Any] | None:
     """Compute distance statistics for one (original, reconstructed) pair.
 
@@ -279,10 +282,16 @@ def _process_pair(
         orig_path: Path to the original ``.oas`` file.
         recon_path: Path to the reconstructed ``.oas`` file.
         mask_layer: GDS mask layer number.
+        spec_nm: EPE spec in nm.  When set, segments whose distance exceeds
+            this value are recorded under the internal key
+            ``"_violation_centers"`` (``float64 [V, 2]``) for downstream
+            marker writing.  Violation counts are also added to the returned
+            dict as ``n_violations`` and ``violation_fraction``.
 
     Returns:
         Dict with ``n_segments``, ``mean_nm``, ``std_nm``, ``min_nm``,
-        ``max_nm``, ``median_nm``, ``p95_nm``, ``p99_nm`` for this pair.
+        ``max_nm``, ``median_nm``, ``p95_nm``, ``p99_nm`` for this pair (plus
+        violation fields when *spec_nm* is given).
         Returns ``None`` if either file has no usable geometry.
     """
     seg_starts, seg_ends = _load_edges_from_oas(orig_path, mask_layer)
@@ -297,7 +306,7 @@ def _process_pair(
 
     distances = _min_dist_points_to_boundary(centers, seg_starts, seg_ends)
 
-    return {
+    result: dict[str, Any] = {
         "pair":        recon_path.stem,
         "n_segments":  int(len(distances)),
         "mean_nm":     float(distances.mean()),
@@ -308,6 +317,61 @@ def _process_pair(
         "p95_nm":      float(np.percentile(distances, 95)),
         "p99_nm":      float(np.percentile(distances, 99)),
     }
+
+    if spec_nm is not None:
+        viol_mask = distances > spec_nm
+        n_viol = int(viol_mask.sum())
+        result["n_violations"] = n_viol
+        result["violation_fraction"] = float(n_viol / len(distances)) if len(distances) > 0 else 0.0
+        result["_violation_centers"] = centers[viol_mask]  # internal — popped before CSV/JSON
+
+    return result
+
+
+# ─── Violation marker writer ──────────────────────────────────────────────────
+
+
+def _write_violation_oas(
+    path: Path,
+    violation_centers: np.ndarray,
+    marker_size_nm: float,
+) -> None:
+    """Write square EPE-violation markers to an OASIS file on ``_VIOLATION_LAYER``.
+
+    Each violating segment center gets a square of side *marker_size_nm*
+    centred on that point.  The output file uses a 1 nm DBU grid (0.001 µm),
+    matching the project default, so coordinates are compatible with source
+    layouts loaded at the same resolution.
+
+    Args:
+        path: Destination ``.oas`` path (created or overwritten).
+        violation_centers: ``float64 [V, 2]`` array of (x, y) coordinates in nm.
+        marker_size_nm: Side length of each marker square in nm.
+    """
+    import klayout.db as db
+
+    _DBU_UM = 0.001  # 1 nm grid
+    scale = 1.0 / (_DBU_UM * 1000.0)  # nm → DBU
+    half = marker_size_nm / 2.0
+
+    layout = db.Layout()
+    layout.dbu = _DBU_UM
+    cell = layout.create_cell("TOP")
+    li = layout.layer(_VIOLATION_LAYER, 0)
+
+    for cx, cy in violation_centers:
+        cell.shapes(li).insert(db.Box(
+            round((cx - half) * scale),
+            round((cy - half) * scale),
+            round((cx + half) * scale),
+            round((cy + half) * scale),
+        ))
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    opts = db.SaveLayoutOptions()
+    opts.format = "OASIS"
+    layout.write(str(path), opts)
+    log.debug("Violations → %s  (%d marker(s))", path.name, len(violation_centers))
 
 
 # ─── Aggregate statistics ─────────────────────────────────────────────────────
@@ -350,7 +414,7 @@ def _aggregate(per_pair: list[dict[str, Any]]) -> dict[str, Any]:
     p99_mean = float(np.mean([r["p99_nm"] for r in per_pair]))
     median_mean = float(np.mean([r["median_nm"] for r in per_pair]))
 
-    return {
+    summary: dict[str, Any] = {
         "n_pairs":          len(per_pair),
         "n_segments_total": int(n_total),
         "mean_nm":          round(weighted_mean, 4),
@@ -362,6 +426,15 @@ def _aggregate(per_pair: list[dict[str, Any]]) -> dict[str, Any]:
         "p99_nm":           round(p99_mean, 4),
     }
 
+    if per_pair and "n_violations" in per_pair[0]:
+        total_viol = sum(r["n_violations"] for r in per_pair)
+        summary["n_violations_total"] = int(total_viol)
+        summary["violation_fraction_mean"] = round(
+            float(np.mean([r["violation_fraction"] for r in per_pair])), 6
+        )
+
+    return summary
+
 
 # ─── I/O helpers ──────────────────────────────────────────────────────────────
 
@@ -372,6 +445,8 @@ def _write_per_pair_csv(rows: list[dict[str, Any]], path: Path) -> None:
         return
     cols = ["pair", "n_segments", "mean_nm", "std_nm", "min_nm", "max_nm",
             "median_nm", "p95_nm", "p99_nm"]
+    if "n_violations" in rows[0]:
+        cols += ["n_violations", "violation_fraction"]
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
@@ -388,17 +463,30 @@ def evaluate_segment_distance(
     recon_dir: Path,
     mask_layer: int,
     output_json: Path,
+    spec_nm: float | None = None,
+    violation_marker_size_nm: float = _DEFAULT_VIOLATION_MARKER_SIZE_NM,
 ) -> dict[str, Any]:
     """Compute segment-center distances for all matched pairs in two directories.
 
     Files in ``recon_dir`` are matched to files in ``orig_dir`` by stem
     (e.g., ``design_m0000.oas`` in both directories).
 
+    When *spec_nm* is provided, any segment whose distance to the nearest
+    original boundary edge exceeds the spec is flagged as an EPE violation.
+    Per-pair violation marker files (one square per violation on
+    ``_VIOLATION_LAYER``) are written to
+    ``<output_json.parent>/<output_json.stem>_violations/``.
+
     Args:
         orig_dir:    Directory containing original per-marker ``.oas`` files.
         recon_dir:   Directory containing reconstructed per-marker ``.oas`` files.
         mask_layer:  GDS layer number of mask polygons.
         output_json: Destination path for the aggregate JSON summary.
+        spec_nm: EPE spec in nm.  Segments with EPE > spec are written as
+            square markers to a ``*_violations/`` subdirectory alongside
+            *output_json*.  When ``None``, no violation markers are produced.
+        violation_marker_size_nm: Side length of each violation marker square
+            in nm (default: ``_DEFAULT_VIOLATION_MARKER_SIZE_NM``).
 
     Returns:
         Aggregate summary dict (also written to ``output_json``).
@@ -412,6 +500,15 @@ def evaluate_segment_distance(
     per_pair: list[dict[str, Any]] = []
     skipped = 0
 
+    violations_dir: Path | None = None
+    if spec_nm is not None:
+        violations_dir = output_json.parent / f"{output_json.stem}_violations"
+        violations_dir.mkdir(parents=True, exist_ok=True)
+        log.info(
+            "EPE spec=%.2f nm  violation markers (layer %d) → %s/",
+            spec_nm, _VIOLATION_LAYER, violations_dir.name,
+        )
+
     log.info("Processing %d file pair(s) from %s", total, recon_dir.name)
 
     for idx, recon_path in enumerate(recon_files, 1):
@@ -422,7 +519,7 @@ def evaluate_segment_distance(
             continue
 
         try:
-            result = _process_pair(orig_path, recon_path, mask_layer)
+            result = _process_pair(orig_path, recon_path, mask_layer, spec_nm=spec_nm)
         except Exception as exc:
             log.warning("Error processing %s: %s", recon_path.name, exc)
             skipped += 1
@@ -432,11 +529,25 @@ def evaluate_segment_distance(
             skipped += 1
             continue
 
+        # Write violation markers and strip internal key before CSV/JSON output.
+        vcenters: np.ndarray | None = result.pop("_violation_centers", None)
+        if violations_dir is not None and vcenters is not None and len(vcenters) > 0:
+            vpath = violations_dir / f"{recon_path.stem}_violations.oas"
+            try:
+                _write_violation_oas(vpath, vcenters, violation_marker_size_nm)
+            except Exception as exc:
+                log.warning("Failed to write violations for %s: %s", recon_path.name, exc)
+
         per_pair.append(result)
+        viol_suffix = (
+            f"  violations={result['n_violations']}/{result['n_segments']}"
+            if "n_violations" in result else ""
+        )
         log.info(
-            "[%d/%d] %s  n=%d  mean=%.3f nm  p95=%.3f nm",
+            "[%d/%d] %s  n=%d  mean=%.3f nm  p95=%.3f nm%s",
             idx, total, result["pair"],
             result["n_segments"], result["mean_nm"], result["p95_nm"],
+            viol_suffix,
         )
 
     log.info(
@@ -445,6 +556,8 @@ def evaluate_segment_distance(
     )
 
     summary = _aggregate(per_pair)
+    if spec_nm is not None:
+        summary["spec_nm"] = spec_nm
 
     # Write per-pair CSV alongside the summary JSON
     csv_path = output_json.with_suffix(".csv")
@@ -473,6 +586,14 @@ def _print_summary(label: str, summary: dict[str, Any], output_json: Path) -> No
     print(f"  Median (nm)      : {summary['median_nm']:.4f}")
     print(f"  P95    (nm)      : {summary['p95_nm']:.4f}")
     print(f"  P99    (nm)      : {summary['p99_nm']:.4f}")
+    if "spec_nm" in summary:
+        viol_total = summary.get("n_violations_total", 0)
+        viol_frac  = summary.get("violation_fraction_mean", 0.0) * 100.0
+        viol_dir   = output_json.parent / f"{output_json.stem}_violations"
+        print(f"  ── EPE spec ──────────────────────────────")
+        print(f"  Spec   (nm)      : {summary['spec_nm']:.4f}")
+        print(f"  Violations total : {viol_total}  ({viol_frac:.1f}% mean per pair)")
+        print(f"  Marker files     : {viol_dir}/")
     print(f"  Output           : {output_json}")
 
 
@@ -494,153 +615,3 @@ def _print_comparison(base: dict[str, Any], corr: dict[str, Any]) -> None:
     print("──────────────────────────────────────────────────────────────────")
 
 
-# ─── CLI ─────────────────────────────────────────────────────────────────────
-
-
-def _parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(
-        description=__doc__,
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    loc = p.add_mutually_exclusive_group()
-    loc.add_argument(
-        "--results-dir", type=Path,
-        metavar="DIR",
-        help=(
-            "Root output directory from evaluate.py.  "
-            "``<DIR>/original/`` and ``<DIR>/reconstructed/`` are used automatically."
-        ),
-    )
-    loc.add_argument(
-        "--correction-results-dir", type=Path,
-        metavar="DIR",
-        help=(
-            "Root output directory from evaluate_correction.py.  "
-            "Runs the distance metric on both ``<DIR>/baseline/reconstructed/`` "
-            "and ``<DIR>/corrected/reconstructed/`` against ``<DIR>/original/``, "
-            "then prints a side-by-side comparison."
-        ),
-    )
-
-    p.add_argument(
-        "--orig-dir", type=Path, metavar="DIR",
-        help="Directory of original per-marker .oas files.",
-    )
-    p.add_argument(
-        "--recon-dir", type=Path, metavar="DIR",
-        help="Directory of reconstructed per-marker .oas files.",
-    )
-    p.add_argument(
-        "--mask-layer", type=int, default=1,
-        help="GDS layer number of mask polygons (default: 1).",
-    )
-    p.add_argument(
-        "--output", type=Path, default=None,
-        help=(
-            "Output JSON summary path.  "
-            "Defaults to ``<results-dir>/segment_distance_summary.json`` "
-            "or ``<recon-dir>/../segment_distance_summary.json``.  "
-            "Ignored when ``--correction-results-dir`` is used "
-            "(outputs are written automatically alongside the correction results)."
-        ),
-    )
-    return p.parse_args()
-
-
-def main() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        datefmt="%H:%M:%S",
-    )
-    args = _parse_args()
-
-    mask_layer = args.mask_layer
-
-    # ── Correction-eval mode: baseline vs. corrected side by side ────────────
-    if args.correction_results_dir is not None:
-        root     = args.correction_results_dir
-        orig_dir = root / "original"
-        base_recon_dir = root / "baseline"  / "reconstructed"
-        corr_recon_dir = root / "corrected" / "reconstructed"
-
-        for d, label in (
-            (orig_dir,       "original"),
-            (base_recon_dir, "baseline/reconstructed"),
-            (corr_recon_dir, "corrected/reconstructed"),
-        ):
-            if not d.is_dir():
-                log.error(
-                    "%s does not exist or is not a directory: %s", label, d
-                )
-                sys.exit(1)
-
-        log.info("Correction mode: %s", root)
-
-        base_json = root / "segment_distance_baseline.json"
-        corr_json = root / "segment_distance_corrected.json"
-
-        log.info("── Baseline pass ──")
-        base_summary = evaluate_segment_distance(
-            orig_dir=orig_dir,
-            recon_dir=base_recon_dir,
-            mask_layer=mask_layer,
-            output_json=base_json,
-        )
-
-        log.info("── Corrected pass ──")
-        corr_summary = evaluate_segment_distance(
-            orig_dir=orig_dir,
-            recon_dir=corr_recon_dir,
-            mask_layer=mask_layer,
-            output_json=corr_json,
-        )
-
-        if not base_summary or not corr_summary:
-            log.warning("No results produced.")
-            sys.exit(0)
-
-        _print_summary("Baseline reconstruction", base_summary, base_json)
-        _print_summary("Corrected reconstruction", corr_summary, corr_json)
-        _print_comparison(base_summary, corr_summary)
-        return
-
-    # ── Standard mode ────────────────────────────────────────────────────────
-    if args.results_dir is not None:
-        orig_dir  = args.results_dir / "original"
-        recon_dir = args.results_dir / "reconstructed"
-        default_output = args.results_dir / "segment_distance_summary.json"
-    elif args.orig_dir is not None and args.recon_dir is not None:
-        orig_dir  = args.orig_dir
-        recon_dir = args.recon_dir
-        default_output = recon_dir.parent / "segment_distance_summary.json"
-    else:
-        log.error(
-            "Provide --results-dir, --correction-results-dir, "
-            "or both --orig-dir and --recon-dir."
-        )
-        sys.exit(1)
-
-    for d, label in ((orig_dir, "orig-dir"), (recon_dir, "recon-dir")):
-        if not d.is_dir():
-            log.error("%s does not exist or is not a directory: %s", label, d)
-            sys.exit(1)
-
-    output_json = args.output if args.output is not None else default_output
-
-    summary = evaluate_segment_distance(
-        orig_dir=orig_dir,
-        recon_dir=recon_dir,
-        mask_layer=mask_layer,
-        output_json=output_json,
-    )
-
-    if not summary:
-        log.warning("No results produced.")
-        sys.exit(0)
-
-    _print_summary("Segment-center distance to original boundary", summary, output_json)
-
-
-if __name__ == "__main__":
-    main()

@@ -18,13 +18,17 @@
 #   ./scripts/segment_distance_eval.sh --run-id attn_D8_c16_B8
 #   ./scripts/segment_distance_eval.sh --run-id correction_attn_D8_c16_B8_a0p2_n5
 #   ./scripts/segment_distance_eval.sh --mask-layer 1 --jobs 4
+#   ./scripts/segment_distance_eval.sh --spec 2.0
+#   ./scripts/segment_distance_eval.sh --spec 2.0 --violation-marker-size-nm 4.0
 #   ./scripts/segment_distance_eval.sh --force
 #   ./scripts/segment_distance_eval.sh --dry-run
 #
 # Defaults:
-#   run-id      (all subdirectories of eval/results/)
-#   mask-layer  1
-#   jobs        1
+#   run-id                  (all subdirectories of eval/results/)
+#   mask-layer              1
+#   jobs                    1
+#   spec                    (none — no violation markers written)
+#   violation-marker-size   2.0 nm
 #
 # Outputs (per results directory):
 #   segment_distance_summary.json       standard mode
@@ -48,28 +52,32 @@ MASK_LAYER=1
 JOBS=1
 FORCE=0
 DRY_RUN=0
+SPEC=""
+VIOLATION_MARKER_SIZE="2.0"
 
 # ── Parse flags ───────────────────────────────────────────────────────────────
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --run-id)      RUN_ID="$2";     shift 2 ;;
-        --mask-layer)  MASK_LAYER="$2"; shift 2 ;;
-        --jobs)        JOBS="$2";       shift 2 ;;
-        --force)       FORCE=1;         shift   ;;
-        --dry-run)     DRY_RUN=1;       shift   ;;
+        --run-id)                   RUN_ID="$2";               shift 2 ;;
+        --mask-layer)               MASK_LAYER="$2";            shift 2 ;;
+        --jobs)                     JOBS="$2";                  shift 2 ;;
+        --spec)                     SPEC="$2";                  shift 2 ;;
+        --violation-marker-size-nm) VIOLATION_MARKER_SIZE="$2"; shift 2 ;;
+        --force)                    FORCE=1;                    shift   ;;
+        --dry-run)                  DRY_RUN=1;                  shift   ;;
         --help)
             sed -n '/^# Usage:/,/^[^#]/p' "$0" | grep '^#' | sed 's/^# \?//'
             exit 0 ;;
         *)
             echo "Unknown flag: $1" >&2
-            echo "Usage: $0 [--run-id ID] [--mask-layer N] [--jobs N] [--force] [--dry-run]" >&2
+            echo "Usage: $0 [--run-id ID] [--mask-layer N] [--jobs N] [--spec NM] [--violation-marker-size-nm NM] [--force] [--dry-run]" >&2
             exit 1 ;;
     esac
 done
 
 RESULTS_ROOT="${PROJECT_ROOT}/eval/results"
-EVAL_SCRIPT="${PROJECT_ROOT}/eval/evaluate_segment_distance.py"
+EVAL_SCRIPT="${PROJECT_ROOT}/eval/evaluate.py"
 
 # ── Activate conda ────────────────────────────────────────────────────────────
 
@@ -122,6 +130,8 @@ echo "  Segment-Distance Evaluation"
 echo "  results root  : ${RESULTS_ROOT}"
 echo "  run_id        : ${RUN_ID:-<all>}"
 echo "  mask_layer    : ${MASK_LAYER}"
+echo "  spec (nm)     : ${SPEC:-<none>}"
+echo "  marker size   : ${VIOLATION_MARKER_SIZE} nm"
 echo "  jobs          : ${JOBS}"
 echo "  force         : $([ ${FORCE} -eq 1 ] && echo yes || echo no)"
 echo "  directories   : ${TOTAL}"
@@ -131,6 +141,12 @@ echo "============================================================"
 echo ""
 
 # ── Per-directory runner ──────────────────────────────────────────────────────
+
+_spec_flags() {
+    if [[ -n "${SPEC}" ]]; then
+        echo "--spec ${SPEC} --violation-marker-size-nm ${VIOLATION_MARKER_SIZE}"
+    fi
+}
 
 run_one() {
     local dir="$1"
@@ -151,11 +167,14 @@ run_one() {
         return 0
     fi
 
+    local spec_flags
+    spec_flags="$(_spec_flags)"
+
     if [[ ${DRY_RUN} -eq 1 ]]; then
         if [[ "${mode}" == "correction" ]]; then
-            echo "[dry-run]  python eval/evaluate_segment_distance.py --correction-results-dir ${dir} --mask-layer ${MASK_LAYER}"
+            echo "[dry-run]  python eval/evaluate.py --correction-results-dir ${dir} --mask-layer ${MASK_LAYER}${spec_flags:+ ${spec_flags}}"
         else
-            echo "[dry-run]  python eval/evaluate_segment_distance.py --results-dir ${dir} --mask-layer ${MASK_LAYER}"
+            echo "[dry-run]  python eval/evaluate.py --results-dir ${dir} --mask-layer ${MASK_LAYER}${spec_flags:+ ${spec_flags}}"
         fi
         return 0
     fi
@@ -166,14 +185,18 @@ run_one() {
     local log_file="${dir}/segment_distance.log"
 
     if [[ "${mode}" == "correction" ]]; then
+        # shellcheck disable=SC2086
         python "${EVAL_SCRIPT}" \
             --correction-results-dir "${dir}" \
             --mask-layer "${MASK_LAYER}" \
+            ${spec_flags} \
             2>&1 | tee "${log_file}"
     else
+        # shellcheck disable=SC2086
         python "${EVAL_SCRIPT}" \
             --results-dir "${dir}" \
             --mask-layer "${MASK_LAYER}" \
+            ${spec_flags} \
             2>&1 | tee "${log_file}"
     fi
     local exit_code=${PIPESTATUS[0]}
@@ -193,7 +216,7 @@ _print_summary() {
     local json
     if [[ "${mode}" == "correction" ]]; then
         # Print side-by-side from the two JSON files via the script's stdout
-        # (already printed by evaluate_segment_distance.py to the log; echo key lines)
+        # (already printed by evaluate.py to the log; echo key lines)
         local bj="${dir}/segment_distance_baseline.json"
         local cj="${dir}/segment_distance_corrected.json"
         [[ -f "${bj}" && -f "${cj}" ]] || return 0
@@ -221,12 +244,15 @@ s = json.load(open(sys.argv[1]))
 for key, label in [("mean_nm","mean"),("median_nm","median"),("p95_nm","p95"),("p99_nm","p99")]:
     v = s.get(key, float("nan"))
     print(f"  {label:<8} {v:.4f} nm")
+if "spec_nm" in s:
+    vf = s.get("violation_fraction_mean", 0.0) * 100.0
+    print(f"  spec     {s['spec_nm']:.4f} nm  violations={s.get('n_violations_total',0)}  ({vf:.1f}% mean)")
 PYEOF
     fi
 }
 
-export -f run_one detect_mode sentinel_path _print_summary
-export FORCE DRY_RUN MASK_LAYER EVAL_SCRIPT
+export -f run_one detect_mode sentinel_path _print_summary _spec_flags
+export FORCE DRY_RUN MASK_LAYER EVAL_SCRIPT SPEC VIOLATION_MARKER_SIZE
 
 # ── Run ───────────────────────────────────────────────────────────────────────
 
