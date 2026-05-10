@@ -10,7 +10,7 @@ csdf:
   grid_res_nm_per_px: 6.0
   marker_layer: 100
   mask_layer: 1
-  truncation_px: 5.0
+  truncation_px: 3.0
 dataset:
   mode: cached
   cache_dir: dataset/cache/

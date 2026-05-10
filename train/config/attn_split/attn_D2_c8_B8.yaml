@@ -1,10 +1,10 @@
 model:
   arch: curve_codec_attn
-  latent_dim: 16
-  compaction_ratio: 32
+  latent_dim: 2
+  compaction_ratio: 8
   quantizer_bits: 8
   encoder_channels: 64
-  attn_heads: 4
+  attn_heads: 2   # D=2 not divisible by 4; use 2 heads (1 channel per head)
   attn_window_size: 7
 csdf:
   grid_res_nm_per_px: 6.0
@@ -34,4 +34,4 @@ training:
 paths:
   dataset_root: dataset/raw/
   checkpoint_dir: checkpoints/
-  run_id: attn_D16_c32_B8
+  run_id: attn_D2_c8_B8
