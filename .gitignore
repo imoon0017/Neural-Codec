@@ -31,3 +31,8 @@ files.zip
 
 # Claude Code local settings
 .claude/
+
+# Experiment configs — only baseline.yaml is canonical
+train/config/**/*.yaml
+train/config/*.yaml
+!train/config/baseline.yaml
